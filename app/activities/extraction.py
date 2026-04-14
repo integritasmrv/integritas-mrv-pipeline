@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv("/opt/enrichiq/.env")
+
 import json
 import os
 import re
@@ -6,6 +9,18 @@ from urllib.parse import urlparse
 
 import asyncpg
 import httpx
+
+HUBSPOT_PROPERTY_MAP = {'legal_name': 'legal_entity_name', 'trade_name': 'name', 'website': 'website', 'email': 'email', 'phone': 'phone', 'street': 'address', 'city': 'city', 'postal_code': 'postal_code', 'country': 'country', 'linkedin_url': 'linkedin_url', 'description': 'description', 'employee_count': 'numberofemployees', 'first_name': 'firstname', 'last_name': 'lastname', 'job_title': 'jobtitle', 'company_name': 'company'}
+
+def _map_to_hubspot_properties(entity_type, attributes):
+    p = {}
+    for k, v in attributes.items():
+        val = v.get('value')
+        if val is None: continue
+        p[HUBSPOT_PROPERTY_MAP.get(k, k)] = str(val)
+    confs = [v.get('confidence', 0) for v in attributes.values()]
+    if confs: p['enrichment_confidence'] = str(max(confs))
+    return p
 
 from app.llm import llm_complete, llm_embed, lightrag_insert, qdrant_upsert
 
