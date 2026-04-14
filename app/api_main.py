@@ -192,6 +192,23 @@ async def trigger_enrichment_payload(payload: dict) -> dict:
     }
 
 
+@app.get("/api/enrichment/status/{entity_id}")
+async def get_enrichment_status(entity_id: str) -> dict:
+    if not ENRICHMENT_DB_URL:
+        return {"status": "error", "message": "DATABASE_URL not configured"}
+    conn = await asyncpg.connect(ENRICHMENT_DB_URL)
+    try:
+        row = await conn.fetchrow(
+            "SELECT id::text, entity_type, label, enrichment_status, business_key, source_system, created_at, updated_at FROM entities WHERE id::text = $1",
+            entity_id,
+        )
+        if not row:
+            return {"status": "not_found", "entity_id": entity_id}
+        return dict(row)
+    finally:
+        await conn.close()
+
+
 @app.post("/api/scrapiq/dispatch")
 @app.post("/api/scrapiq-dispatch")
 async def dispatch_scrapiq(
