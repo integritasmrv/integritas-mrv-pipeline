@@ -80,7 +80,7 @@ async def listen_crm(db: dict):
 
     loop = asyncio.get_event_loop()
 
-    def notification_handler(connection, channel, payload, worker_id):
+    def notification_handler(connection, pid, channel, payload):
         loop.create_task(handle_notification(crm_name, payload))
 
     await conn.add_listener(NOTIFICATION_QUEUE, notification_handler)
