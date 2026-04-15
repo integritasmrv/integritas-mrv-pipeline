@@ -34,45 +34,73 @@ class EnrichIQWriteback(BaseModel):
 
 
 @app.post("/webhook/hubspot")
-async def webhook_hubspot(payload: HubspotWebhookPayload, request: Request):
+async def webhook_hubspot(request: Request):
     try:
-        owner_id = payload.data.get("properties", {}).get("hubspot_owner_id", "")
-        print(f"[WEBHOOK] owner_id={owner_id}, object_id={payload.data.get('properties', {}).get('hs_object_id', '')}")
+        body = await request.json()
+        print(f"[WEBHOOK] raw body: {str(body)[:500]}", flush=True)
+
+        items = []
+        if isinstance(body, list):
+            items = body
+        elif isinstance(body, dict):
+            objs = body.get("objects")
+            if objs and isinstance(objs, list):
+                items = objs
+            elif "objectId" in body or "properties" in body:
+                items = [body]
+            elif "data" in body:
+                items = [{"properties": body["data"].get("properties", body["data"])}]
+            else:
+                items = [body]
 
         conn = await asyncpg.connect(
             host="10.0.13.2", port=5432, database="integritasmrv_crm",
             user="integritasmrv_crm_user", password="Int3gr1t@smrv_S3cure_P@ssw0rd_2026"
         )
-        route_row = await conn.fetchrow(
-            "SELECT target_crm FROM crm_sync_routing WHERE hubspot_owner_id = $1 AND active = true LIMIT 1",
-            str(owner_id)
-        )
-        await conn.close()
-
-        if route_row:
-            target_crm = route_row["target_crm"].lower()
-        else:
-            target_crm = payload.data.get("routing_rules", {}).get("target_crm", "integritasmrv")
-
-        business_key = payload.data.get("properties", {}).get("hs_object_id")
 
         client = await Client.connect(TEMPORAL_ADDR)
-        wf_id = await client.start_workflow(
-            "IngestWorkflow",
-            {
-                "source": payload.source,
-                "mapping_name": "hubspot_to_crm",
-                "target_crm": target_crm,
-                "business_key": str(business_key) if business_key else None,
-                "data": payload.data,
-            },
-            id=f"ingest-hubspot-{business_key}",
-            task_queue=TASK_QUEUE,
-        )
+        results = []
 
-        return {"status": "accepted", "workflow_id": str(wf_id), "target_crm": target_crm, "owner_id": owner_id}
+        for item in items:
+            props = item.get("properties", {})
+            object_type = item.get("objectType", item.get("object_type", "contact")).lower()
+            object_id = item.get("objectId", item.get("hs_object_id", props.get("hs_object_id", "")))
+            owner_id = props.get("hubspot_owner_id", "")
+
+            print(f"[WEBHOOK] type={object_type} id={object_id} owner={owner_id}", flush=True)
+
+            route_row = await conn.fetchrow(
+                "SELECT target_crm FROM crm_sync_routing WHERE hubspot_owner_id = $1 AND active = true LIMIT 1",
+                str(owner_id)
+            )
+
+            if route_row:
+                target_crm = route_row["target_crm"].lower()
+            else:
+                target_crm = "integritasmrv"
+
+            mapping_name = "hubspot_to_crm"
+            business_key = str(object_id) if object_id else None
+
+            wf_id = await client.start_workflow(
+                "IngestWorkflow",
+                {
+                    "source": "hubspot",
+                    "mapping_name": mapping_name,
+                    "target_crm": target_crm,
+                    "business_key": business_key,
+                    "data": {"properties": props, "objectType": object_type, "objectId": object_id},
+                },
+                id=f"ingest-hubspot-{business_key}",
+                task_queue=TASK_QUEUE,
+            )
+
+            results.append({"objectId": object_id, "status": "accepted", "target_crm": target_crm})
+
+        await conn.close()
+        return {"status": "ok", "processed": len(results), "results": results}
     except Exception as e:
-        print(f"[WEBHOOK] Error: {e}")
+        print(f"[WEBHOOK] Error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
