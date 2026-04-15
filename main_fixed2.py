@@ -218,7 +218,7 @@ async def chatwoot_webhook(request: Request):
         
         rag_context = ""
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=5.0) as client:
                 rag_resp = client.post(
                     "http://intelligence-lightrag:9621/query/data",
                     json={"query": user_message, "mode": "hybrid"},
@@ -227,7 +227,7 @@ async def chatwoot_webhook(request: Request):
                 if rag_resp.status_code == 200:
                     rag_data = rag_resp.json()
                     chunks = rag_data.get("data", {}).get("chunks", [])
-                    texts = [c.get("content", "")[:500] for c in chunks[:2]]
+                    texts = [c.get("content", "")[:300] for c in chunks[:2]]
                     rag_context = "\n\n".join(texts)
         except Exception as e:
             print(f"RAG error: {e}")
