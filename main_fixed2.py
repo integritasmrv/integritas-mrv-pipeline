@@ -264,7 +264,7 @@ Context:
                         "Content-Type": "application/json"
                     },
                 json={
-                    "model": "minimax-m2.7",
+                    "model": "qwen3-8b",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
