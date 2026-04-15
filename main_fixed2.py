@@ -232,30 +232,31 @@ async def chatwoot_webhook(request: Request):
         except Exception as e:
             print(f"RAG error: {e}")
         
-        system_prompt = f"""You are a helpful sales assistant for Belinus, a Belgian company specializing in battery storage and energy solutions.
+        system_prompt = f"""You are a helpful sales assistant for Belinus, a Belgian company specializing in battery storage and energy solutions. IMPORTANT: You ONLY discuss Belinus products and services. NEVER mention other companies or products.
+
+RESPOND IN THE SAME LANGUAGE as the user's message (English, Dutch, or French).
 
 Products:
 - Energywall G1: Lithium-free residential energy storage using graphene supercapacitor technology
 - 50000 charge cycles, 99% round-trip efficiency
 - 10 year warranty, 25 year design life
+- Modular from 5kWh to 500kWh
 
-Services:
-- Energy storage solutions for residential and commercial
-- Battery backup systems
-- Solar integration
-
-Important info:
-- Belgian engineering
+About Belinus:
+- Belgian engineering company
+- Headquarters at Thor Park Genk, Belgium
 - Website: www.belinus.net
-- Based in Belgium
+- Founded 2015, acquired by RBD N.V. in 2024
 
 If the user wants to speak with a human, respond with exactly: [TRANSFER]
 
-Context from knowledge base:
-{rag_context if rag_context else 'No specific context available. Use the general Belinus information above.'}"""
+Use Belinus information above AND context from knowledge base below.
+
+Context:
+{rag_context if rag_context else 'No context available.'}"""
         
         try:
-            with httpx.Client(timeout=45.0) as client:
+            with httpx.Client(timeout=30.0) as client:
                 llm_resp = client.post(
                     "http://10.0.4.19:4000/v1/chat/completions",
                     headers={
@@ -263,7 +264,7 @@ Context from knowledge base:
                         "Content-Type": "application/json"
                     },
                 json={
-                    "model": "minimax-m2.7",
+                    "model": "fast-local",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
