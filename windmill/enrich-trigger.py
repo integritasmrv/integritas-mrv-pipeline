@@ -1,6 +1,5 @@
 def main(entity_id: str = "test", business_key: str = "integritasmrv", entity_type: str = "company", label: str = "Test Entity", source_system: str = "windmill"):
     import urllib.request, json
-
     payload = {
         "entity_type": entity_type,
         "label": label,
@@ -20,5 +19,4 @@ def main(entity_id: str = "test", business_key: str = "integritasmrv", entity_ty
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         raise Exception(f"HTTP {e.code}: {body}")
-
     return result
