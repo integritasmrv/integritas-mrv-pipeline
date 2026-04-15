@@ -3,10 +3,7 @@ targets:
     table: nb_crm_contacts
     fields:
       - source: properties.firstname
-        target: firstname
-        transform: strip
-      - source: properties.lastname
-        target: lastname
+        target: name
         transform: strip
       - source: properties.hs_object_id
         target: hubspot_id
@@ -34,6 +31,9 @@ targets:
         transform: strip
       - source: properties.website
         target: website
+        transform: strip
+      - source: properties.lastname
+        target: extra.last_name
         transform: strip
       - source: properties.hs_lead_status
         target: extra.source_system

@@ -33,16 +33,22 @@ targets:
     table: nb_crm_contacts
     fields:
       - source: first_name
-        target: label
+        target: name
         transform: strip
-      - source: last_name
-        target: entity_attributes.lastname
+      - source: email
+        target: email
+        transform: strip
+      - source: phone
+        target: phone
+        transform: strip
+      - source: job_title
+        target: title
         transform: strip
       - source: form_id
         target: lead_source
         transform: strip
       - source: message
-        target: entity_attributes.message
+        target: extra.message
         transform: strip
 
   company:

@@ -54,6 +54,22 @@ def _set_nested(data: dict, path: str, value: Any) -> None:
 @activity.defn
 async def apply_mapping(payload: dict, mapping_name: str) -> dict:
     config = _load_mapping_with_extends(mapping_name)
+
+    if "targets" in config:
+        result = {}
+        for target_name, target_config in config["targets"].items():
+            target_result = {}
+            table = target_config.get("table", "")
+            if table:
+                target_result["table"] = table
+            for field in target_config.get("fields", []):
+                value = _extract(payload, field["source"])
+                value = _transform(value, field.get("transform", ""))
+                _set_nested(target_result, field["target"], value)
+            if target_result:
+                result[target_name] = target_result
+        return result
+
     result = {}
     for field in config.get("fields", []):
         value = _extract(payload, field["source"])

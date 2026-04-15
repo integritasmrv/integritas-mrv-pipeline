@@ -86,7 +86,10 @@ async def upsert_crm_entity(
         # Handle extra fields (anything not a direct column)
         for key, value in mapped_data.items():
             if key not in known_fields and value is not None:
-                extra_data[key] = value
+                if key.startswith("extra."):
+                    extra_data[key[6:]] = value
+                else:
+                    extra_data[key] = value
         
         # Add enrichment_status
         enrichment_status = mapped_data.get("enrichment_status", "pending")
