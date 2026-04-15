@@ -272,6 +272,7 @@ Context from knowledge base:
                 )
                 login_data = login_resp.json()
                 token = login_data.get("data", {}).get("access_token")
+                print(f"Chatwoot token: {token[:20] if token else 'None'}...")
                 
                 if token:
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -283,11 +284,14 @@ Context from knowledge base:
                             json={"status": "open"}
                         )
                     
-                    client.post(
+                    msg_resp = client.post(
                         f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
                         headers=headers,
                         json={"content": ai_response, "message_type": "outgoing"}
                     )
+                    print(f"Chatwoot post response: {msg_resp.status_code}")
+                else:
+                    print("Chatwoot: No token received")
         except Exception as e:
             print(f"Chatwoot post error: {e}")
         
