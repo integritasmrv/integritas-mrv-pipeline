@@ -217,6 +217,10 @@ async def chatwoot_webhook(request: Request):
         
         user_message = message_data.get("content", "") if message_data else payload.get("content", "")
         
+        # Fallback for account_id - use inbox_id to derive or default to 1
+        inbox_id = payload.get("conversation", {}).get("inbox_id")
+        account_id = account_id or 1  # Default to account 1
+        
         if not user_message or not conversation_id:
             return {"handled": False, "reason": f"missing data user={user_message} conv={conversation_id}"}
         
