@@ -227,7 +227,7 @@ Context from knowledge base:
 {rag_context if rag_context else 'No specific context available.'}"""
         
         try:
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=60.0) as client:
                 llm_resp = client.post(
                     "http://10.0.4.19:4000/v1/chat/completions",
                     headers={
