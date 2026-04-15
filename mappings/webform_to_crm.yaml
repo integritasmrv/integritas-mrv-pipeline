@@ -4,10 +4,10 @@ targets:
   lead:
     table: nb_crm_leads
     fields:
-      - source: first_name
+      - source: first-name
         target: name
         transform: strip
-      - source: email
+      - source: your-email
         target: email
         transform: strip
       - source: company
@@ -16,7 +16,7 @@ targets:
       - source: phone
         target: phone
         transform: strip
-      - source: job_title
+      - source: function
         target: title
         transform: strip
       - source: message
@@ -32,16 +32,16 @@ targets:
   contact:
     table: nb_crm_contacts
     fields:
-      - source: first_name
+      - source: first-name
         target: name
         transform: strip
-      - source: email
+      - source: your-email
         target: email
         transform: strip
       - source: phone
         target: phone
         transform: strip
-      - source: job_title
+      - source: function
         target: title
         transform: strip
       - source: form_id
@@ -55,14 +55,14 @@ targets:
     table: nb_crm_customers
     fields:
       - source: company
-        target: label
+        target: name
         transform: strip
-      - source: company
-        target: entity_attributes.name
+      - source: company-website
+        target: website
         transform: strip
       - source: form_id
         target: source_system
         transform: const:webform
       - source: message
-        target: entity_attributes.description
+        target: extra.description
         transform: strip
