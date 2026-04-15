@@ -99,3 +99,51 @@ async def get_crm_entity(
         return dict(row) if row else None
     finally:
         await conn.close()
+
+
+@activity.defn
+async def check_entity_exists(
+    external_ids: dict,
+    target_crm: str = "integritasmrv",
+    table: str = "nb_crm_contacts",
+) -> dict:
+    config = CRM_CONFIGS.get(target_crm)
+    if not config:
+        raise ValueError(f"Unknown CRM: {target_crm}")
+
+    conn = await asyncpg.connect(
+        host=config["host"],
+        port=config["port"],
+        database=config["db"],
+        user=config["user"],
+        password=config["password"],
+    )
+    try:
+        lookups = []
+        params = []
+        if external_ids.get("hubspot_id"):
+            params.append(str(external_ids["hubspot_id"]))
+            lookups.append(f"external_ids->>'hubspot_id' = ${len(params)}")
+        if external_ids.get("kbo_id"):
+            params.append(external_ids["kbo_id"])
+            lookups.append(f"external_ids->>'kbo_id' = ${len(params)}")
+        if external_ids.get("vat_number"):
+            params.append(external_ids["vat_number"])
+            lookups.append(f"external_ids->>'vat_number' = ${len(params)}")
+        if external_ids.get("email"):
+            params.append(external_ids["email"])
+            lookups.append(f"entity_attributes->>'email' = ${len(params)}")
+
+        if not lookups:
+            return {"exists": False, "entity_id": None}
+
+        query = f"SELECT id, label, enrichment_status FROM {table} WHERE {' OR '.join(lookups)} LIMIT 1"
+        row = await conn.fetchrow(query, *params)
+        return {
+            "exists": row is not None,
+            "entity_id": row["id"] if row else None,
+            "label": row["label"] if row else None,
+            "enrichment_status": row["enrichment_status"] if row else None,
+        }
+    finally:
+        await conn.close()

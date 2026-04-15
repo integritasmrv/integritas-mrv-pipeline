@@ -1,6 +1,6 @@
 import asyncio
 from temporalio.client import Client
-from temporalio.worker import Worker
+from temporalio.worker import Worker, ActivityExecutor
 
 from workers.workflows.ingest_workflow import IngestWorkflow
 from workers.workflows.writeback_workflow import WritebackWorkflow
@@ -32,6 +32,7 @@ async def main():
             update_hubspot_contact,
             update_hubspot_company,
         ],
+        activity_executor=ActivityExecutor.AUTO,
     )
 
     print(f"Temporal worker connecting to {temporal_addr}, namespace=Integritasmrv, task_queue={task_queue}")
