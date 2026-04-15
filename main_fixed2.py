@@ -264,7 +264,7 @@ Context:
                         "Content-Type": "application/json"
                     },
                 json={
-                    "model": "fast-local",
+                    "model": "minimax-m2.7",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
