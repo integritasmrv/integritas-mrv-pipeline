@@ -37,17 +37,21 @@ class IngestWorkflow:
                 if not isinstance(target_data, dict):
                     continue
                 table = target_data.pop("table", None)
-                if table:
-                    target_data["enrichment_status"] = "pending"
-                    flat_data = _flatten(target_data)
-                    key_prefix = "webform" if source == "webform" else "hubspot"
-                    key_value = f"{key_prefix}-{target_name}-{business_key}" if business_key else None
-                    result = await workflow.execute_activity(
-                        upsert_crm_entity,
-                        args=[flat_data, target_crm, table, key_value],
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-                    results[target_name] = result
+                if not table:
+                    continue
+                non_null = {k: v for k, v in target_data.items() if v is not None}
+                if not non_null:
+                    continue
+                target_data["enrichment_status"] = "pending"
+                flat_data = _flatten(target_data)
+                key_prefix = "webform" if source == "webform" else "hubspot"
+                key_value = f"{key_prefix}-{target_name}-{business_key}" if business_key else None
+                result = await workflow.execute_activity(
+                    upsert_crm_entity,
+                    args=[flat_data, target_crm, table, key_value],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                results[target_name] = result
 
             return {
                 "lead_id": results.get("lead", {}).get("id"),

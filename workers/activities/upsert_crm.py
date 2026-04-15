@@ -76,6 +76,9 @@ async def upsert_crm_entity(
             "location_country": "location_country"
         }
         
+        if not mapped_data.get("name"):
+            mapped_data["name"] = mapped_data.get("email") or mapped_data.get("phone") or "Unknown"
+        
         for source_key, target_col in known_fields.items():
             if source_key in mapped_data and mapped_data[source_key] is not None:
                 col_names.append(target_col)
