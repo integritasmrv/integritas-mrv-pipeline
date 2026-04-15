@@ -191,24 +191,31 @@ async def chatwoot_webhook(request: Request):
         
         print(f"=== WEBHOOK DEBUG ===")
         print(f"event: {payload.get('event')}")
-        print(f"message_type: {payload.get('message', {}).get('message_type')} (type: {type(payload.get('message', {}).get('message_type'))})")
-        print(f"content: {payload.get('message', {}).get('content')}")
-        print(f"conversation: {payload.get('conversation')}")
-        print(f"conversation_id: {payload.get('conversation_id')}")
+        print(f"message_type: {payload.get('message_type')} (type: {type(payload.get('message_type'))})")
+        print(f"content: {payload.get('content')}")
+        print(f"conversation[id]: {payload.get('conversation', {}).get('id')}")
         print(f"account_id: {payload.get('account_id')}")
         print(f"====================")
         
         if payload.get("event") != "message_created":
             return {"handled": False, "reason": "not message_created"}
         
-        message = payload.get("message", {})
-        msg_type = message.get("message_type")
+        conversation_id = payload.get("conversation", {}).get("id")
+        account_id = payload.get("account_id")
+        message_data = payload.get("message", {})
+        msg_type = message_data.get("message_type") if message_data else None
+        
+        if not msg_type:
+            # Try extracting from conversation.messages
+            messages = payload.get("conversation", {}).get("messages", [])
+            if messages:
+                msg_type = messages[0].get("message_type")
+                message_data = messages[0]
+        
         if str(msg_type) not in ("0", "incoming", "1"):
             return {"handled": False, "reason": f"not incoming, got {msg_type}"}
         
-        user_message = message.get("content", "")
-        conversation_id = payload.get("conversation", {}).get("id") or payload.get("conversation_id")
-        account_id = payload.get("account_id") or payload.get("account", {}).get("id")
+        user_message = message_data.get("content", "") if message_data else payload.get("content", "")
         
         if not user_message or not conversation_id:
             return {"handled": False, "reason": f"missing data user={user_message} conv={conversation_id}"}
