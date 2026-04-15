@@ -265,33 +265,23 @@ Context from knowledge base:
             should_handoff = True
         
         try:
+            # Use the admin API token directly
+            headers = {"api_access_token": "3JGewDYGGD78t7s1zB4rbskk", "Content-Type": "application/json"}
+            
             with httpx.Client(timeout=10.0) as client:
-                login_resp = client.post(
-                    "https://chat.belinus.net/auth/sign_in",
-                    json={"email": "admin@belinus.net", "password": "BelinusAdmin123!"}
-                )
-                login_data = login_resp.json()
-                token = login_data.get("data", {}).get("access_token")
-                print(f"Chatwoot token: {token[:20] if token else 'None'}...")
-                
-                if token:
-                    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                    
-                    if should_handoff:
-                        client.patch(
-                            f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}",
-                            headers=headers,
-                            json={"status": "open"}
-                        )
-                    
-                    msg_resp = client.post(
-                        f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
+                if should_handoff:
+                    client.patch(
+                        f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}",
                         headers=headers,
-                        json={"content": ai_response, "message_type": "outgoing"}
+                        json={"status": "open"}
                     )
-                    print(f"Chatwoot post response: {msg_resp.status_code}")
-                else:
-                    print("Chatwoot: No token received")
+                
+                msg_resp = client.post(
+                    f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
+                    headers=headers,
+                    json={"content": ai_response, "message_type": "outgoing"}
+                )
+                print(f"Chatwoot post response: {msg_resp.status_code}")
         except Exception as e:
             print(f"Chatwoot post error: {e}")
         
