@@ -1,5 +1,6 @@
 import asyncio
 import asyncpg
+import sys
 import json
 from datetime import datetime
 from temporalio.client import Client
@@ -28,37 +29,47 @@ NOTIFICATION_QUEUE = "enrichment_queue"
 TASK_QUEUE = "integritasmrv-ingest"
 TEMPORAL_ADDR = "10.0.4.16:7233"
 
+temporal_client = None
 
-async def handle_notification(connection, channel, payload, worker_id):
+
+async def get_temporal_client():
+    global temporal_client
+    if temporal_client is None:
+        temporal_client = await Client.connect(TEMPORAL_ADDR)
+    return temporal_client
+
+
+async def handle_notification(crm_name: str, payload_str: str):
     try:
-        payload_str = payload.decode()
         parts = payload_str.split("|")
         if len(parts) < 2:
-            print(f"[{channel}] Invalid payload: {payload_str}")
+            print(f"[{crm_name}] Invalid payload: {payload_str}", flush=True)
             return
 
         entity_id = int(parts[0])
         hubspot_id = parts[1] if len(parts) > 1 else None
         timestamp = parts[2] if len(parts) > 2 else datetime.utcnow().isoformat()
 
-        client = await Client.connect(TEMPORAL_ADDR)
+        client = await get_temporal_client()
+        wf_id = f"enrich-{crm_name}-{entity_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
         await client.start_workflow(
             "EnrichmentWorkflow",
             {
                 "entity_id": entity_id,
-                "crm_name": channel,
+                "crm_name": crm_name,
                 "hubspot_id": hubspot_id,
                 "timestamp": timestamp,
             },
-            id=f"enrich-{channel}-{entity_id}-{timestamp.replace(':', '').replace('.', '')}",
+            id=wf_id,
             task_queue=TASK_QUEUE,
         )
-        print(f"[{channel}] Triggered EnrichmentWorkflow for entity {entity_id}")
+        print(f"[{crm_name}] Triggered EnrichmentWorkflow for entity {entity_id}", flush=True)
     except Exception as e:
-        print(f"[{channel}] Error: {e}")
+        print(f"[{crm_name}] Error: {e}", flush=True)
 
 
 async def listen_crm(db: dict):
+    crm_name = db["name"]
     conn = await asyncpg.connect(
         host=db["host"],
         port=db["port"],
@@ -66,13 +77,15 @@ async def listen_crm(db: dict):
         user=db["user"],
         password=db["password"],
     )
-    
+
+    loop = asyncio.get_event_loop()
+
     def notification_handler(connection, channel, payload, worker_id):
-        asyncio.create_task(handle_notification(connection, channel, payload, worker_id))
-    
+        loop.create_task(handle_notification(crm_name, payload))
+
     await conn.add_listener(NOTIFICATION_QUEUE, notification_handler)
-    print(f"[{db['name']}] Listening on {NOTIFICATION_QUEUE}...")
-    
+    print(f"[{crm_name}] Listening on {NOTIFICATION_QUEUE}...", flush=True)
+
     try:
         while True:
             await asyncio.sleep(3600)
@@ -83,6 +96,7 @@ async def listen_crm(db: dict):
 
 
 async def main():
+    print("Starting enrichment listener...", flush=True)
     await asyncio.gather(*[listen_crm(db) for db in CRM_DBS])
 
 
