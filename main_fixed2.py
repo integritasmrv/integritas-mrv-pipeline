@@ -189,14 +189,6 @@ async def chatwoot_webhook(request: Request):
     try:
         payload = await request.json()
         
-        print(f"=== WEBHOOK DEBUG ===")
-        print(f"event: {payload.get('event')}")
-        print(f"message_type: {payload.get('message_type')} (type: {type(payload.get('message_type'))})")
-        print(f"content: {payload.get('content')}")
-        print(f"conversation[id]: {payload.get('conversation', {}).get('id')}")
-        print(f"account_id: {payload.get('account_id')}")
-        print(f"====================")
-        
         if payload.get("event") != "message_created":
             return {"handled": False, "reason": "not message_created"}
         
