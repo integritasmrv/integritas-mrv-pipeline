@@ -1,5 +1,6 @@
 import asyncio
 import json
+import decimal
 import asyncpg
 from datetime import datetime, timezone
 from typing import Any
@@ -178,7 +179,9 @@ async def get_crm_entity(
         row = await conn.fetchrow(
             f"SELECT * FROM {table} WHERE id = $1", entity_id
         )
-        return dict(row) if row else None
+        if not row:
+            return None
+        return {k: (float(v) if isinstance(v, decimal.Decimal) else v) for k, v in dict(row).items()}
     finally:
         await conn.close()
 
