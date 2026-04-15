@@ -103,14 +103,14 @@ async def upsert_crm_entity(
             param_idx += 1
         
         # Always update timestamp
-        set_clauses.append("updatedAt = NOW()")
+        set_clauses.append('"updatedAt" = NOW()')
         
         hubspot_id = mapped_data.get("hubspot_id")
         
         if hubspot_id:
             # Check if record exists
             existing = await conn.fetchrow(
-                f"SELECT id FROM {table} WHERE hubspot_id = $1",
+                f'SELECT id FROM {table} WHERE hubspot_id = $1',
                 str(hubspot_id)
             )
             
@@ -127,7 +127,7 @@ async def upsert_crm_entity(
                 return {"id": record["id"], "created": False}
             else:
                 # INSERT
-                col_names.append("createdAt")
+                col_names.append('"createdAt"')
                 col_values.append(datetime.now(timezone.utc))
                 insert_sql = f"""
                     INSERT INTO {table} ({', '.join(col_names)})
@@ -138,7 +138,7 @@ async def upsert_crm_entity(
                 return {"id": record["id"], "created": record["created"]}
         else:
             # No hubspot_id, just insert
-            col_names.append("createdAt")
+            col_names.append('"createdAt"')
             col_values.append(datetime.now(timezone.utc))
             insert_sql = f"""
                 INSERT INTO {table} ({', '.join(col_names)})
