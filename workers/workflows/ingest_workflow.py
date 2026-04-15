@@ -1,8 +1,8 @@
+from datetime import timedelta
 from temporalio import workflow
 
 
 def _flatten(data: dict, prefix: str = "") -> dict:
-    """Flatten nested dict like {'extra': {'company_name': 'X'}} to {'extra.company_name': 'X'}"""
     result = {}
     for key, value in data.items():
         if isinstance(value, dict):
@@ -25,7 +25,11 @@ class IngestWorkflow:
         target_crm = payload.get("target_crm", "integritasmrv")
         business_key = payload.get("business_key")
 
-        mapped = await apply_mapping(payload.get("data", payload), mapping_name)
+        mapped = await workflow.execute_activity(
+            apply_mapping,
+            args=[payload.get("data", payload), mapping_name],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
 
         if isinstance(mapped, dict) and any(k in mapped for k in ("lead", "contact", "company")):
             results = {}
@@ -35,15 +39,14 @@ class IngestWorkflow:
                 table = target_data.pop("table", None)
                 if table:
                     target_data["enrichment_status"] = "pending"
-                    # Flatten nested paths like extra.company_name
                     flat_data = _flatten(target_data)
                     key_prefix = "webform" if source == "webform" else "hubspot"
                     key_value = f"{key_prefix}-{target_name}-{business_key}" if business_key else None
-                    result = await upsert_crm_entity(
-                        mapped_data=flat_data,
-                        target_crm=target_crm,
-                        table=table,
-                        business_key_value=key_value,
+                    result = await workflow.execute_activity(
+                        upsert_crm_entity,
+                        args=[flat_data, target_crm, table, key_value],
+                        kwargs={},
+                        start_to_close_timeout=timedelta(seconds=30),
                     )
                     results[target_name] = result
 
@@ -59,10 +62,11 @@ class IngestWorkflow:
         else:
             mapped["enrichment_status"] = "pending"
             flat_data = _flatten(mapped)
-            result = await upsert_crm_entity(
-                mapped_data=flat_data,
-                target_crm=target_crm,
-                business_key_value=business_key,
+            result = await workflow.execute_activity(
+                upsert_crm_entity,
+                args=[flat_data, target_crm, "nb_crm_contacts", business_key],
+                kwargs={},
+                start_to_close_timeout=timedelta(seconds=30),
             )
             return {
                 "entity_id": result["id"],

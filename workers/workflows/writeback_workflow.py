@@ -1,3 +1,4 @@
+from datetime import timedelta
 from temporalio import workflow
 
 
@@ -20,32 +21,33 @@ class WritebackWorkflow:
         ea["enrichment_score"] = enriched_data.get("enrichment_score")
         ea["last_enriched_at"] = enriched_data.get("last_enriched_at")
 
-        update_result = await update_crm_enrichment(
-            entity_id=entity_id,
-            entity_attributes=ea,
-            enrichment_status="enriched",
-            enrichment_score=enriched_data.get("enrichment_score"),
-            target_crm=target_crm,
+        timeout = timedelta(seconds=30)
+
+        update_result = await workflow.execute_activity(
+            update_crm_enrichment,
+            args=[entity_id, ea, "enriched", enriched_data.get("enrichment_score"), target_crm],
+            start_to_close_timeout=timeout,
         )
 
-        dedup_result = await dedup_merge_check(
-            entity_id=entity_id,
-            external_ids=external_ids,
-            entity_attributes=ea,
-            target_crm=target_crm,
+        dedup_result = await workflow.execute_activity(
+            dedup_merge_check,
+            args=[entity_id, external_ids, ea, target_crm],
+            start_to_close_timeout=timeout,
         )
 
         hubspot_result = {"updated": False}
         if source_system == "hubspot":
             if entity_type == "contact" and external_ids.get("hubspot_id"):
-                hubspot_result = update_hubspot_contact(
-                    hubspot_id=external_ids["hubspot_id"],
-                    enriched_data=enriched_data,
+                hubspot_result = await workflow.execute_activity(
+                    update_hubspot_contact,
+                    args=[external_ids["hubspot_id"], enriched_data],
+                    start_to_close_timeout=timeout,
                 )
             elif entity_type == "company" and external_ids.get("hubspot_company_id"):
-                hubspot_result = update_hubspot_company(
-                    hubspot_id=external_ids["hubspot_company_id"],
-                    enriched_data=enriched_data,
+                hubspot_result = await workflow.execute_activity(
+                    update_hubspot_company,
+                    args=[external_ids["hubspot_company_id"], enriched_data],
+                    start_to_close_timeout=timeout,
                 )
 
         return {
