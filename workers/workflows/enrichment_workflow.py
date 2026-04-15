@@ -1,5 +1,4 @@
 import asyncio
-import httpx
 from temporalio import workflow
 
 
@@ -13,6 +12,7 @@ class EnrichmentWorkflow:
         entity_type = payload.get("entity_type", "contact")
 
         from workers.activities.upsert_crm import get_crm_entity
+        from workers.activities.update_hubspot import trigger_enrichiq
 
         entity = await get_crm_entity(
             target_crm=crm_name,
@@ -28,19 +28,14 @@ class EnrichmentWorkflow:
         max_rounds = 3
 
         for round_num in range(1, max_rounds + 1):
-            with httpx.Client(timeout=30) as client:
-                trigger_resp = client.post(
-                    "https://enrichiq.integritasmrv.com/api/trigger",
-                    json={
-                        "entity_type": entity_type,
-                        "business_key": business_key,
-                        "round": round_num,
-                        "source": "hubspot",
-                    }
-                )
-
-            if trigger_resp.status_code not in (200, 201, 202):
-                return {"status": "error", "reason": "enrichiq_trigger_failed", "detail": trigger_resp.text}
+            trigger_result = await trigger_enrichiq(
+                entity_type=entity_type,
+                business_key=business_key,
+                round_num=round_num,
+                source="hubspot",
+            )
+            if trigger_result["status_code"] not in (200, 201, 202):
+                return {"status": "error", "reason": "enrichiq_trigger_failed", "detail": trigger_result["body"]}
 
             await asyncio.sleep(15)
 

@@ -10,7 +10,7 @@ from workers.activities.apply_mapping import apply_mapping, apply_mapping_batch
 from workers.activities.upsert_crm import upsert_crm_entity, get_crm_entity, check_entity_exists
 from workers.activities.update_crm import update_crm_enrichment
 from workers.activities.dedup_merge_check import dedup_merge_check
-from workers.activities.update_hubspot import update_hubspot_contact, update_hubspot_company
+from workers.activities.update_hubspot import update_hubspot_contact, update_hubspot_company, trigger_enrichiq
 
 
 async def main():
@@ -33,6 +33,7 @@ async def main():
             dedup_merge_check,
             update_hubspot_contact,
             update_hubspot_company,
+            trigger_enrichiq,
         ],
         activity_executor=ThreadPoolExecutor(max_workers=10),
     )

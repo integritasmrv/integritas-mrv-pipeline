@@ -2,8 +2,24 @@ import httpx
 import os
 from temporalio import activity
 
+
 HUBSPOT_BASE = "https://api.hubapi.com"
 PAT = os.environ.get("HUBSPOT_PAT", "")
+
+
+@activity.defn
+async def trigger_enrichiq(entity_type: str, business_key: str, round_num: int, source: str) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://enrichiq.integritasmrv.com/api/trigger",
+            json={
+                "entity_type": entity_type,
+                "business_key": business_key,
+                "round": round_num,
+                "source": source,
+            }
+        )
+        return {"status_code": resp.status_code, "body": resp.text}
 
 
 @activity.defn
