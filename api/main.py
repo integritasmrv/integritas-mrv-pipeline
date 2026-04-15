@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import asyncio
+import asyncpg
 from temporalio.client import Client
 
 
