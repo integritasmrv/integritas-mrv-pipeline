@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import Optional
 import asyncio
 import time
+import asyncpg
 import httpx
 from temporalio.client import Client
 
@@ -12,11 +13,19 @@ app = FastAPI(title="IntegritasMRV Temporal Bridge")
 TEMPORAL_ADDR = "10.0.4.16:7233"
 TASK_QUEUE = "integritasmrv-ingest"
 
+_db_pool = None
+_temporal_client = None
 
-class HubspotWebhookPayload(BaseModel):
-    source: str = "hubspot"
-    data: dict
-    target_crm: Optional[str] = None
+
+@app.on_event("startup")
+async def startup():
+    global _db_pool, _temporal_client
+    _db_pool = await asyncpg.create_pool(
+        host="10.0.13.2", port=5432, database="integritasmrv_crm",
+        user="integritasmrv_crm_user", password="Int3gr1t@smrv_S3cure_P@ssw0rd_2026",
+        min_size=1, max_size=5,
+    )
+    _temporal_client = await Client.connect(TEMPORAL_ADDR)
 
 
 class WritebackPayload(BaseModel):
@@ -50,33 +59,70 @@ class WebformPayload(BaseModel):
 
 
 @app.post("/webhook/hubspot")
-async def webhook_hubspot(payload: HubspotWebhookPayload, request: Request):
+async def webhook_hubspot(request: Request):
     try:
-        routing_rules = payload.data.get("routing_rules", {})
-        target_crm = payload.target_crm or routing_rules.get("target_crm", "integritasmrv")
+        body = await request.json()
+        print(f"[WEBHOOK] raw body: {str(body)[:500]}", flush=True)
 
-        business_key = (
-            payload.data.get("properties", {})
-            .get("hs_object_id")
-        )
-        wf_id = f"ingest-hubspot-{business_key}"
+        items = []
+        if isinstance(body, list):
+            items = body
+        elif isinstance(body, dict):
+            objs = body.get("objects")
+            if objs and isinstance(objs, list):
+                items = objs
+            elif "objectId" in body or "properties" in body:
+                items = [body]
+            elif "data" in body:
+                inner = body["data"]
+                if isinstance(inner, dict):
+                    items = [{"properties": inner.get("properties", inner)}]
+                else:
+                    items = [body]
+            else:
+                items = [body]
 
-        client = await Client.connect(TEMPORAL_ADDR)
-        await client.start_workflow(
-            "IngestWorkflow",
-            {
-                "source": payload.source,
-                "mapping_name": "hubspot_to_crm",
-                "target_crm": target_crm,
-                "business_key": str(business_key) if business_key else None,
-                "data": payload.data,
-            },
-            id=wf_id,
-            task_queue=TASK_QUEUE,
-        )
+        results = []
 
-        return {"status": "accepted", "workflow_id": wf_id, "target_crm": target_crm}
+        async with _db_pool.acquire() as conn:
+            for item in items:
+                props = item.get("properties", {})
+                object_type = item.get("objectType", item.get("object_type", "contact")).lower()
+                object_id = item.get("objectId", item.get("hs_object_id", props.get("hs_object_id", "")))
+                owner_id = props.get("hubspot_owner_id", "")
+
+                print(f"[WEBHOOK] type={object_type} id={object_id} owner={owner_id}", flush=True)
+
+                route_row = await conn.fetchrow(
+                    "SELECT target_crm FROM crm_sync_routing WHERE hubspot_owner_id = $1 AND active = true LIMIT 1",
+                    str(owner_id),
+                )
+
+                if route_row:
+                    target_crm = route_row["target_crm"].lower()
+                else:
+                    target_crm = "integritasmrv"
+
+                business_key = str(object_id) if object_id else None
+
+                await _temporal_client.start_workflow(
+                    "IngestWorkflow",
+                    {
+                        "source": "hubspot",
+                        "mapping_name": "hubspot_to_crm",
+                        "target_crm": target_crm,
+                        "business_key": business_key,
+                        "data": {"properties": props, "objectType": object_type, "objectId": object_id},
+                    },
+                    id=f"ingest-hubspot-{business_key}",
+                    task_queue=TASK_QUEUE,
+                )
+
+                results.append({"objectId": object_id, "status": "accepted", "target_crm": target_crm})
+
+        return {"status": "ok", "processed": len(results), "results": results}
     except Exception as e:
+        print(f"[WEBHOOK] Error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
