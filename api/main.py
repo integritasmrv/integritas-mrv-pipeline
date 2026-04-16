@@ -100,10 +100,12 @@ async def webhook_hubspot(request: Request):
                     object_type = item.get("objectType", "contact").lower()
 
                 props = item.get("properties", {})
-                owner_id = props.get("hubspot_owner_id", item.get("propertyValue", ""))
+                property_name = item.get("propertyName", "")
+                is_owner_change = (property_name == "hubspot_owner_id")
+                owner_id_from_event = item.get("propertyValue", "")
 
                 if is_hubspot_event and object_id:
-                    print(f"[WEBHOOK] HubSpot event: {sub_type} id={object_id}", flush=True)
+                    print(f"[WEBHOOK] HubSpot event: {sub_type} id={object_id} prop={property_name}", flush=True)
                     async with httpx.AsyncClient(timeout=15.0) as hc:
                         if object_type == "company":
                             url = f"https://api.hubapi.com/crm/v3/objects/companies/{object_id}?properties=name,phone,website,industry,description,country,city,hubspot_owner_id,hubspot_company_id,hs_object_id,vat_number__c,linkedin_company_page"
@@ -116,13 +118,24 @@ async def webhook_hubspot(request: Request):
                             })
                             if resp.status_code == 200:
                                 data = resp.json()
-                                props = data.get("properties", {})
-                                owner_id = props.get("hubspot_owner_id", "")
-                                print(f"[WEBHOOK] Fetched {object_type} {object_id}: owner={owner_id}", flush=True)
+                                fetched_props = data.get("properties", {})
+                                fetched_owner = fetched_props.get("hubspot_owner_id", "")
+                                if is_owner_change:
+                                    props = fetched_props
+                                    owner_id = owner_id_from_event
+                                    print(f"[WEBHOOK] Owner change: API owner={fetched_owner}, routing by event owner={owner_id}", flush=True)
+                                else:
+                                    props = fetched_props
+                                    owner_id = fetched_owner
+                                    print(f"[WEBHOOK] Fetched {object_type} {object_id}: owner={owner_id}", flush=True)
                             else:
                                 print(f"[WEBHOOK] HubSpot API {resp.status_code}: {resp.text[:200]}", flush=True)
+                                owner_id = owner_id_from_event or fetched_owner if 'fetched_owner' in dir() else owner_id_from_event
                         except Exception as e:
                             print(f"[WEBHOOK] HubSpot API error: {e}", flush=True)
+                            owner_id = owner_id_from_event
+                else:
+                    owner_id = props.get("hubspot_owner_id", "")
 
                 print(f"[WEBHOOK] type={object_type} id={object_id} owner={owner_id}", flush=True)
 
