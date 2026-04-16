@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 WORKDIR /app
 ENV PYTHONPATH=/app
-RUN pip install temporalio httpx asyncpg pyyaml polars
+RUN pip install temporalio==1.0.0 httpx asyncpg pyyaml polars
 COPY workers/ /app/workers/
 COPY mappings/ /app/mappings/
 CMD ["python", "-m", "workers.main"]
