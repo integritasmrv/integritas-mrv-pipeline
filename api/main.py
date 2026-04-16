@@ -305,14 +305,20 @@ Context:
                 )
                 llm_data = llm_resp.json()
                 if llm_data.get("error"):
-                    raise Exception(llm_data["error"].get("message", "LLM error"))
+                    raise Exception(str(llm_data["error"]))
                 
-                ai_response = llm_data.get("choices", [{}])[0].get("message", {}).get("content", "I'm having trouble responding right now.")
-                should_handoff = "[TRANSFER]" in ai_response
-                ai_response = ai_response.replace("[TRANSFER]", "").strip()
+                ai_response = llm_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if not ai_response:
+                    ai_response = "Ik heb even geen antwoord. Een mens zal zo snel mogelijk reageren."
+                    should_handoff = True
+                else:
+                    should_handoff = "[TRANSFER]" in ai_response
+                    ai_response = ai_response.replace("[TRANSFER]", "").strip()
         except Exception as e:
-            print(f"LLM error: {e}")
-            ai_response = "I'm having trouble responding right now. A human agent will be with you shortly."
+            import traceback
+            print(f"LLM error: {type(e).__name__}: {e}")
+            print(f"Trace: {traceback.format_exc()[:200]}")
+            ai_response = "Ik heb even geen antwoord. Een mens zal zo snel mogelijk reageren."
             should_handoff = True
         
         # Stop typing indicator
@@ -335,8 +341,10 @@ Context:
                     headers=headers,
                     json={"content": ai_response, "message_type": "outgoing"}
                 )
+                print(f"Chatwoot response sent: {ai_response[:50]}")
         except Exception as e:
-            print(f"Chatwoot post error: {e}")
+            import traceback
+            print(f"Chatwoot post error: {type(e).__name__}: {e}")
         
         return {"handled": True, "reply": ai_response, "handoff": should_handoff}
         
