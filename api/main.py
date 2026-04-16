@@ -270,7 +270,7 @@ If user wants human: [TRANSFER]
 Context: {rag_context if rag_context else 'No additional context'}"""
         
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 llm_resp = await client.post(
                     "http://10.0.4.19:4000/v1/chat/completions",
                     headers={
@@ -278,7 +278,7 @@ Context: {rag_context if rag_context else 'No additional context'}"""
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "fast-local",
+                        "model": "minimax-m2.7",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
