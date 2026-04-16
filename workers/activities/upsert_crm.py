@@ -32,11 +32,6 @@ async def upsert_crm_entity(
     table: str = "nb_crm_contacts",
     business_key_value: str = None,
 ) -> dict:
-    """
-    Upsert for NocoBase CRM tables.
-    Uses hubspot_id as the unique key for upsert matching.
-    Maps flat fields to direct columns, extra fields to JSONB 'extra' column.
-    """
     config = CRM_CONFIGS.get(target_crm)
     if not config:
         raise ValueError(f"Unknown CRM: {target_crm}")
@@ -50,82 +45,71 @@ async def upsert_crm_entity(
     )
 
     try:
-        # Direct columns that map straight to table columns
         direct_columns = [
             "name", "email", "phone", "title", "website", "city", "country",
             "description", "industry", "linkedin", "hubspot_id", "hs_owner_id",
             "customer_id", "account_number", "vat_number", "location_country"
         ]
-        
-        # Fields that go into the 'extra' JSONB column
+
         extra_data = {}
-        
-        # Build the SET clause for UPDATE and column list for INSERT
         set_clauses = []
         col_names = []
         col_values = []
         param_idx = 1
-        
-        # Map known fields
+
         known_fields = {
-            "name": "name", "email": "email", "phone": "phone", 
+            "name": "name", "email": "email", "phone": "phone",
             "title": "title", "website": "website", "city": "city",
-            "country": "country", "description": "description", 
+            "country": "country", "description": "description",
             "industry": "industry", "linkedin": "linkedin",
             "hubspot_id": "hubspot_id", "hs_owner_id": "hs_owner_id",
             "customer_id": "customer_id", "vat_number": "vat_number",
             "location_country": "location_country"
         }
-        
+
         if not mapped_data.get("name"):
             mapped_data["name"] = mapped_data.get("email") or mapped_data.get("phone") or "Unknown"
-        
+
         for source_key, target_col in known_fields.items():
             if source_key in mapped_data and mapped_data[source_key] is not None:
                 col_names.append(target_col)
                 col_values.append(mapped_data[source_key])
                 set_clauses.append(f"{target_col} = ${param_idx}")
                 param_idx += 1
-        
-        # Handle extra fields (anything not a direct column)
+
         for key, value in mapped_data.items():
             if key not in known_fields and value is not None:
                 if key.startswith("extra."):
                     extra_data[key[6:]] = value
                 else:
                     extra_data[key] = value
-        
-        # Add enrichment_status (only for contacts and customers, not leads)
+
         if table != "nb_crm_leads":
             enrichment_status = mapped_data.get("enrichment_status", "To Be Enriched")
             set_clauses.append(f"enrichment_status = ${param_idx}")
             col_names.append("enrichment_status")
             col_values.append(enrichment_status)
             param_idx += 1
-        
-        # Set extra JSONB
+
         if extra_data:
             set_clauses.append(f"extra = ${param_idx}")
             col_names.append("extra")
             col_values.append(json.dumps(extra_data))
             param_idx += 1
-        
-        # Always update timestamp
+
         set_clauses.append('"updatedAt" = NOW()')
-        
+
         hubspot_id = mapped_data.get("hubspot_id")
-        
+
         if hubspot_id:
-            # Check if record exists
             existing = await conn.fetchrow(
                 f'SELECT id FROM {table} WHERE hubspot_id = $1',
                 str(hubspot_id)
             )
-            
+
             if existing:
-                # UPDATE
                 update_sql = f"""
-                    UPDATE {table} 
+                    UPDATE {table}
                     SET {', '.join(set_clauses)}
                     WHERE hubspot_id = ${param_idx}
                     RETURNING id, FALSE as created
@@ -134,7 +118,6 @@ async def upsert_crm_entity(
                 record = await conn.fetchrow(update_sql, *col_values)
                 return {"id": record["id"], "created": False}
             else:
-                # INSERT
                 col_names.append('"createdAt"')
                 col_values.append(datetime.now(timezone.utc))
                 insert_sql = f"""
@@ -145,7 +128,6 @@ async def upsert_crm_entity(
                 record = await conn.fetchrow(insert_sql, *col_values)
                 return {"id": record["id"], "created": record["created"]}
         else:
-            # No hubspot_id, just insert
             col_names.append('"createdAt"')
             col_values.append(datetime.now(timezone.utc))
             insert_sql = f"""
@@ -182,6 +164,7 @@ async def get_crm_entity(
         )
         if not row:
             return None
+<<<<<<< HEAD
         result = {}
         for k, v in dict(row).items():
             if isinstance(v, decimal.Decimal):
@@ -202,38 +185,8 @@ async def check_entity_exists(
     company_data: dict = None,
     target_crm: str = "integritasmrv",
 ) -> dict:
-    """
-    Check if contact AND/OR company already exists in CRM.
-    
-    Checks both nb_crm_contacts and nb_crm_customers tables.
-    Returns exact matches AND fuzzy matches so caller can decide:
-      - Contact is new but company exists → link to company
-      - Contact exists → update/merge
-      - Company exists → update/merge
-      - Neither exists → create both
-    
-    Args:
-        external_ids: Dict with any of: hubspot_id, hubspot_company_id, kbo_id, vat_number
-        contact_data: Dict with: email, phone, linkedin_url, firstname, lastname
-        company_data: Dict with: name, website, linkedin_url, country, city
-        target_crm: "integritasmrv" or "poweriq"
-    
-    Returns:
-        {
-            "contact": {
-                "exact_match": {"exists": bool, "entity_id": int|None, "label": str|None},
-                "fuzzy_matches": [{"entity_id": int, "label": str, "score": float, "match_type": str}],
-                "action": "create" / "update" / "merge" / "link_to_company"
-            },
-            "company": {
-                "exact_match": {"exists": bool, "entity_id": int|None, "label": str|None},
-                "fuzzy_matches": [{"entity_id": int, "label": str, "score": float, "match_type": str}],
-                "action": "create" / "update" / "merge"
-            }
-        }
-    """
     import asyncio
-    
+
     external_ids = external_ids or {}
     contact_data = contact_data or {}
     company_data = company_data or {}
