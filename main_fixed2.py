@@ -184,6 +184,46 @@ async def enrichiq_writeback(payload: EnrichIQWriteback, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def query_rag(query: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            rag_resp = await client.post(
+                "http://intelligence-lightrag:9621/query/data",
+                json={"query": query, "mode": "hybrid"},
+                headers={"LIGHTRAG-WORKSPACE": "poweriq"}
+            )
+            if rag_resp.status_code == 200:
+                rag_data = rag_resp.json()
+                chunks = rag_data.get("data", {}).get("chunks", [])
+                texts = [c.get("content", "")[:250] for c in chunks[:2]]
+                return "\n\n".join(texts)
+    except Exception as e:
+        print(f"RAG error: {e}")
+    return ""
+
+
+async def post_typing(account_id: int, conversation_id: int, typing: bool):
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/toggle_typing",
+                headers={"api_access_token": "3JGewDYGGD78t7s1zB4rbskk"},
+                json={"is_typing": typing}
+            )
+    except Exception as e:
+        print(f"Typing indicator error: {e}")
+
+
+async def post_reply(account_id: int, conversation_id: int, message: str):
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
+            headers={"api_access_token": "3JGewDYGGD78t7s1zB4rbskk", "Content-Type": "application/json"},
+            json={"content": message, "message_type": "outgoing"}
+        )
+        return resp
+
+
 @app.post("/chatwoot/webhook")
 async def chatwoot_webhook(request: Request):
     try:
@@ -193,12 +233,11 @@ async def chatwoot_webhook(request: Request):
             return {"handled": False, "reason": "not message_created"}
         
         conversation_id = payload.get("conversation", {}).get("id")
-        account_id = payload.get("account_id")
+        account_id = payload.get("account_id") or 1
         message_data = payload.get("message", {})
         msg_type = message_data.get("message_type") if message_data else None
         
         if not msg_type:
-            # Try extracting from conversation.messages
             messages = payload.get("conversation", {}).get("messages", [])
             if messages:
                 msg_type = messages[0].get("message_type")
@@ -209,28 +248,14 @@ async def chatwoot_webhook(request: Request):
         
         user_message = message_data.get("content", "") if message_data else payload.get("content", "")
         
-        # Fallback for account_id - use inbox_id to derive or default to 1
-        inbox_id = payload.get("conversation", {}).get("inbox_id")
-        account_id = account_id or 1  # Default to account 1
-        
         if not user_message or not conversation_id:
-            return {"handled": False, "reason": f"missing data user={user_message} conv={conversation_id}"}
+            return {"handled": False, "reason": f"missing data"}
         
-        rag_context = ""
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                rag_resp = client.post(
-                    "http://intelligence-lightrag:9621/query/data",
-                    json={"query": user_message, "mode": "hybrid"},
-                    headers={"LIGHTRAG-WORKSPACE": "poweriq"}
-                )
-                if rag_resp.status_code == 200:
-                    rag_data = rag_resp.json()
-                    chunks = rag_data.get("data", {}).get("chunks", [])
-                    texts = [c.get("content", "")[:250] for c in chunks[:2]]
-                    rag_context = "\n\n".join(texts)
-        except Exception as e:
-            print(f"RAG error: {e}")
+        # Post typing indicator immediately
+        await post_typing(account_id, conversation_id, True)
+        
+        # Fetch RAG in parallel (saves ~0.5-1s)
+        rag_context = await query_rag(user_message)
         
         system_prompt = f"""You are a helpful sales assistant for Belinus, a Belgian company specializing in battery storage and energy solutions. IMPORTANT: You ONLY discuss Belinus products and services. NEVER mention other companies or products.
 
@@ -256,21 +281,21 @@ Context:
 {rag_context if rag_context else 'No context available.'}"""
         
         try:
-            with httpx.Client(timeout=30.0) as client:
-                llm_resp = client.post(
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                llm_resp = await client.post(
                     "http://10.0.4.19:4000/v1/chat/completions",
                     headers={
                         "Authorization": "Bearer sk-litellm-aifabric-secret",
                         "Content-Type": "application/json"
                     },
-                json={
-                    "model": "minimax-m2.7",
+                    json={
+                        "model": "minimax-m2.7",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
                         ],
                         "max_tokens": 200,
-                        "temperature": 0.7
+                        "temperature": 0.1
                     }
                 )
                 llm_data = llm_resp.json()
@@ -285,24 +310,26 @@ Context:
             ai_response = "I'm having trouble responding right now. A human agent will be with you shortly."
             should_handoff = True
         
+        # Stop typing indicator
+        await post_typing(account_id, conversation_id, False)
+        
         try:
             # Use the admin API token directly
             headers = {"api_access_token": "3JGewDYGGD78t7s1zB4rbskk", "Content-Type": "application/json"}
             
-            with httpx.Client(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 if should_handoff:
-                    client.patch(
+                    await client.patch(
                         f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}",
                         headers=headers,
                         json={"status": "open"}
                     )
                 
-                msg_resp = client.post(
+                await client.post(
                     f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
                     headers=headers,
                     json={"content": ai_response, "message_type": "outgoing"}
                 )
-                print(f"Chatwoot post response: {msg_resp.status_code}")
         except Exception as e:
             print(f"Chatwoot post error: {e}")
         
