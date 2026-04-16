@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import asyncio
+import os
 import time
 import asyncpg
 import httpx
@@ -62,34 +63,66 @@ class WebformPayload(BaseModel):
 async def webhook_hubspot(request: Request):
     try:
         body = await request.json()
-        print(f"[WEBHOOK] raw body: {str(body)[:500]}", flush=True)
+        print(f"[WEBHOOK] raw body: {str(body)[:800]}", flush=True)
 
         items = []
         if isinstance(body, list):
             items = body
         elif isinstance(body, dict):
-            objs = body.get("objects")
-            if objs and isinstance(objs, list):
-                items = objs
+            if "objects" in body:
+                items = body["objects"]
             elif "objectId" in body or "properties" in body:
                 items = [body]
             elif "data" in body:
                 inner = body["data"]
-                if isinstance(inner, dict):
-                    items = [{"properties": inner.get("properties", inner)}]
-                else:
-                    items = [body]
+                items = [{"properties": inner.get("properties", inner)}] if isinstance(inner, dict) else [body]
+            elif "subscriptionType" in body:
+                items = [body]
             else:
                 items = [body]
 
+        hubspot_pat = os.environ.get("HUBSPOT_PAT", "")
         results = []
 
         async with _db_pool.acquire() as conn:
             for item in items:
+                sub_type = item.get("subscriptionType", "")
+                object_id = str(item.get("objectId", ""))
+                is_hubspot_event = bool(sub_type)
+
+                if "company" in sub_type:
+                    object_type = "company"
+                elif "contact" in sub_type:
+                    object_type = "contact"
+                elif "deal" in sub_type:
+                    object_type = "deal"
+                else:
+                    object_type = item.get("objectType", "contact").lower()
+
                 props = item.get("properties", {})
-                object_type = item.get("objectType", item.get("object_type", "contact")).lower()
-                object_id = item.get("objectId", item.get("hs_object_id", props.get("hs_object_id", "")))
-                owner_id = props.get("hubspot_owner_id", "")
+                owner_id = props.get("hubspot_owner_id", item.get("propertyValue", ""))
+
+                if is_hubspot_event and object_id:
+                    print(f"[WEBHOOK] HubSpot event: {sub_type} id={object_id}", flush=True)
+                    async with httpx.AsyncClient(timeout=15.0) as hc:
+                        if object_type == "company":
+                            url = f"https://api.hubapi.com/crm/v3/objects/companies/{object_id}?properties=name,phone,website,industry,description,country,city,hubspot_owner_id,hubspot_company_id,hs_object_id,vat_number__c,linkedin_company_page"
+                        else:
+                            url = f"https://api.hubapi.com/crm/v3/objects/contacts/{object_id}?properties=firstname,lastname,email,phone,jobtitle,city,country,website,linkedin_primary_company,hubspot_owner_id,hs_object_id,company"
+                        try:
+                            resp = await hc.get(url, headers={
+                                "Authorization": f"Bearer {hubspot_pat}",
+                                "Content-Type": "application/json",
+                            })
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                props = data.get("properties", {})
+                                owner_id = props.get("hubspot_owner_id", "")
+                                print(f"[WEBHOOK] Fetched {object_type} {object_id}: owner={owner_id}", flush=True)
+                            else:
+                                print(f"[WEBHOOK] HubSpot API {resp.status_code}: {resp.text[:200]}", flush=True)
+                        except Exception as e:
+                            print(f"[WEBHOOK] HubSpot API error: {e}", flush=True)
 
                 print(f"[WEBHOOK] type={object_type} id={object_id} owner={owner_id}", flush=True)
 
@@ -234,21 +267,21 @@ async def enrichiq_writeback(payload: EnrichIQWriteback, request: Request):
 async def chatwoot_webhook(request: Request):
     try:
         payload = await request.json()
-        
+
         if payload.get("event") != "message_created":
             return {"handled": False, "reason": "not message_created"}
-        
+
         message = payload.get("message", {})
         if message.get("message_type") != "incoming":
             return {"handled": False, "reason": "not incoming"}
-        
+
         user_message = message.get("content", "")
         conversation_id = payload.get("conversation_id")
         account_id = payload.get("account_id")
-        
+
         if not user_message or not conversation_id:
             return {"handled": False, "reason": "missing data"}
-        
+
         rag_context = ""
         try:
             with httpx.Client(timeout=15.0) as client:
@@ -259,17 +292,16 @@ async def chatwoot_webhook(request: Request):
                 )
                 rag_data = rag_resp.json()
                 chunks = rag_data.get("data", {}).get("chunks", [])
-                # Limit to top 2 chunks, truncate to 500 chars each
                 texts = [c.get("content", "")[:500] for c in chunks[:2]]
                 rag_context = "\n\n".join(texts)
         except Exception as e:
             print(f"RAG error: {e}")
-        
+
         system_prompt = f"""You are a helpful sales assistant. If the user wants to speak with a human, respond with exactly: [TRANSFER]
 
 Context from knowledge base:
 {rag_context if rag_context else 'No specific context available.'}"""
-        
+
         try:
             with httpx.Client(timeout=45.0) as client:
                 llm_resp = client.post(
@@ -291,7 +323,7 @@ Context from knowledge base:
                 llm_data = llm_resp.json()
                 if llm_data.get("error"):
                     raise Exception(llm_data["error"].get("message", "LLM error"))
-                
+
                 ai_response = llm_data.get("choices", [{}])[0].get("message", {}).get("content", "I'm having trouble responding right now.")
                 should_handoff = "[TRANSFER]" in ai_response
                 ai_response = ai_response.replace("[TRANSFER]", "").strip()
@@ -299,7 +331,7 @@ Context from knowledge base:
             print(f"LLM error: {e}")
             ai_response = "I'm having trouble responding right now. A human agent will be with you shortly."
             should_handoff = True
-        
+
         try:
             with httpx.Client(timeout=10.0) as client:
                 login_resp = client.post(
@@ -308,17 +340,17 @@ Context from knowledge base:
                 )
                 login_data = login_resp.json()
                 token = login_data.get("data", {}).get("access_token")
-                
+
                 if token:
                     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                    
+
                     if should_handoff:
                         client.patch(
                             f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}",
                             headers=headers,
                             json={"status": "open"}
                         )
-                    
+
                     client.post(
                         f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
                         headers=headers,
@@ -326,9 +358,9 @@ Context from knowledge base:
                     )
         except Exception as e:
             print(f"Chatwoot post error: {e}")
-        
+
         return {"handled": True, "reply": ai_response, "handoff": should_handoff}
-        
+
     except Exception as e:
         print(f"Webhook error: {e}")
         return {"handled": False, "error": str(e)}
