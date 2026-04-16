@@ -278,7 +278,7 @@ Context: {rag_context if rag_context else 'No additional context'}"""
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "gpu/qwen2.5-32b",
+                        "model": "fast-local",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
