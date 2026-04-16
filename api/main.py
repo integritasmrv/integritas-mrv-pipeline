@@ -225,6 +225,11 @@ async def post_reply(account_id: int, conversation_id: int, message: str):
         return resp
 
 
+@app.get("/chatwoot/webhook")
+async def chatwoot_webhook_get():
+    return {"status": "ok"}
+
+
 @app.post("/chatwoot/webhook")
 async def chatwoot_webhook(request: Request):
     try:
