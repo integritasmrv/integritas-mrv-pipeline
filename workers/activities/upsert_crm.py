@@ -164,16 +164,14 @@ async def get_crm_entity(
         )
         if not row:
             return None
-<<<<<<< HEAD
-        result = {}
-        for k, v in dict(row).items():
+
+        def _serialize_val(v):
             if isinstance(v, decimal.Decimal):
-                result[k] = float(v)
-            elif isinstance(v, datetime):
-                result[k] = v.isoformat()
-            else:
-                result[k] = v
-        return result
+                return float(v)
+            if hasattr(v, 'isoformat'):
+                return v.isoformat()
+            return v
+        return {k: _serialize_val(v) for k, v in dict(row).items()}
     finally:
         await conn.close()
 
