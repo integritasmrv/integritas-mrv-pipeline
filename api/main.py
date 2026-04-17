@@ -20,6 +20,9 @@ CACHE_TTL = 3600
 MODELS = ["minimax-m2.7", "fast-local", "qwen2.5-14b"]
 MAX_RETRIES = 1
 LLM_TIMEOUT = 15.0
+OLLAMA_DIRECT = "http://10.0.4.27:11434"
+OLLAMA_DIRECT_MODEL = "llama3.2:latest"
+OLLAMA_DIRECT_TIMEOUT = 10.0
 
 DIRECT_PATTERNS = [
     r"^(hi|hello|hey|bonjour|salut|hallo|goededag|goeie|bonsoir)",
@@ -98,16 +101,37 @@ async def call_llm(prompt: str, model: str) -> Tuple[Optional[str], bool]:
             )
             data = resp.json()
             if data.get("error"):
-                print(f"LLM error on {model}: {data['error']}")
+                print(f"LLM error on {model}: {str(data['error'])[:80]}")
                 return None, True
             result = extract_llm_response(data)
             if result:
                 return result, False
-            print(f"Empty response from {model}, raw: {str(data)[:100]}")
+            print(f"Empty response from {model}")
             return None, True
     except Exception as e:
-        print(f"LLM call failed on {model}: {type(e).__name__}: {e}")
+        print(f"LLM call failed on {model}: {type(e).__name__}: {str(e)[:60]}")
         return None, True
+
+async def call_ollama_direct(prompt: str) -> Optional[str]:
+    try:
+        async with httpx.AsyncClient(timeout=OLLAMA_DIRECT_TIMEOUT) as client:
+            resp = await client.post(
+                f"{OLLAMA_DIRECT}/api/chat",
+                json={
+                    "model": OLLAMA_DIRECT_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"num_predict": 80}
+                }
+            )
+            data = resp.json()
+            content = data.get("message", {}).get("content", "").strip()
+            if content:
+                return content
+            return None
+    except Exception as e:
+        print(f"Ollama direct failed: {type(e).__name__}: {str(e)[:60]}")
+        return None
 
 async def get_llm_response(prompt: str) -> Optional[str]:
     for model in MODELS:
@@ -116,8 +140,14 @@ async def get_llm_response(prompt: str) -> Optional[str]:
             return result
         if not should_retry:
             break
-    fallback = "Bedankt voor je bericht! Een van onze teamleden neemt snel contact op."
-    print(f"All models failed, using fallback")
+    
+    ollama_result = await call_ollama_direct(prompt)
+    if ollama_result:
+        print(f"Ollama direct fallback worked")
+        return ollama_result
+    
+    fallback = "Hallo! 👋 Leuk dat je contact opneemt met Belinus! Ik help je graag. Stel gerust je vraag!"
+    print(f"All models failed, using friendly fallback")
     return fallback
 
 class HubspotPayload(BaseModel):
