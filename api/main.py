@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, AsyncIterator
 import asyncio
 import time
+import re
+import hashlib
+import json
 import httpx
 from temporalio.client import Client
 
@@ -12,12 +15,53 @@ app = FastAPI(title="IntegritasMRV Temporal Bridge")
 TEMPORAL_ADDR = "10.0.4.16:7233"
 TASK_QUEUE = "integritasmrv-ingest"
 
+REDIS_HOST = "10.0.4.27"
+REDIS_PORT = 6379
+CACHE_TTL = 3600
+
+DIRECT_PATTERNS = [
+    r"^(hi|hello|hey|bonjour|salut|hallo|goededag|goeie|bonsoir)",
+    r"^(merci|thanks|thank you|dank u|danke|bedankt)$",
+    r"^(ok|okay|yes|no|oui|non|ja)$",
+    r"^(goodbye|bye|tot ziens|à bientôt|adieu)$",
+    r"^(how are you|how do you do|ça va)$",
+    r"^what is your name$",
+    r"^(?i)(who are you|wat ben jij)$",
+]
+
+def needs_retrieval(query: str) -> bool:
+    q = query.strip().lower()
+    for pattern in DIRECT_PATTERNS:
+        if re.match(pattern, q):
+            return False
+    return True
+
+def cache_key(query: str, prefix: str = "rag") -> str:
+    return f"{prefix}:{hashlib.sha256(query.encode()).hexdigest()}"
+
+async def get_cached(key: str) -> Optional[str]:
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, socket_timeout=1)
+        cached = r.get(key)
+        if cached:
+            return cached.decode()
+    except Exception as e:
+        print(f"Cache get error: {e}")
+    return None
+
+async def set_cached(key: str, value: str):
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, socket_timeout=1)
+        r.setex(key, CACHE_TTL, value)
+    except Exception as e:
+        print(f"Cache set error: {e}")
 
 class HubspotWebhookPayload(BaseModel):
     source: str = "hubspot"
     data: dict
     target_crm: Optional[str] = None
-
 
 class WritebackPayload(BaseModel):
     entity_id: int
@@ -27,12 +71,10 @@ class WritebackPayload(BaseModel):
     enriched_data: dict
     external_ids: dict
 
-
 class EnrichIQWriteback(BaseModel):
     entity: dict
     trusted_attributes: dict
     meta: dict
-
 
 class WebformPayload(BaseModel):
     first_name: Optional[str] = None
@@ -48,19 +90,17 @@ class WebformPayload(BaseModel):
     form_id: Optional[str] = None
     form_title: Optional[str] = None
 
+class AskRequest(BaseModel):
+    query: str
+    stream: bool = True
 
 @app.post("/webhook/hubspot")
 async def webhook_hubspot(payload: HubspotWebhookPayload, request: Request):
     try:
         routing_rules = payload.data.get("routing_rules", {})
         target_crm = payload.target_crm or routing_rules.get("target_crm", "integritasmrv")
-
-        business_key = (
-            payload.data.get("properties", {})
-            .get("hs_object_id")
-        )
+        business_key = payload.data.get("properties", {}).get("hs_object_id")
         wf_id = f"ingest-hubspot-{business_key}"
-
         client = await Client.connect(TEMPORAL_ADDR)
         await client.start_workflow(
             "IngestWorkflow",
@@ -74,22 +114,18 @@ async def webhook_hubspot(payload: HubspotWebhookPayload, request: Request):
             id=wf_id,
             task_queue=TASK_QUEUE,
         )
-
         return {"status": "accepted", "workflow_id": wf_id, "target_crm": target_crm}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/ingest/webform")
 async def ingest_webform(request: Request):
     try:
         payload = await request.json()
-
         email = payload.get("your-email") or payload.get("email", "unknown")
         first_name = payload.get("first-name", "")
         last_name = payload.get("last-name", "")
         wf_id = f"webform-{email}-{int(time.time())}"
-
         client = await Client.connect(TEMPORAL_ADDR)
         await client.start_workflow(
             "IngestWorkflow",
@@ -116,73 +152,9 @@ async def ingest_webform(request: Request):
             id=wf_id,
             task_queue=TASK_QUEUE,
         )
-
         return {"status": "accepted", "workflow_id": wf_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/writeback")
-async def writeback(payload: WritebackPayload, request: Request):
-    try:
-        wf_id = f"writeback-{payload.entity_id}"
-        client = await Client.connect(TEMPORAL_ADDR)
-        await client.start_workflow(
-            "WritebackWorkflow",
-            {
-                "entity_id": payload.entity_id,
-                "target_crm": payload.target_crm,
-                "source_system": payload.source_system,
-                "entity_type": payload.entity_type,
-                "enriched_data": payload.enriched_data,
-                "external_ids": payload.external_ids,
-            },
-            id=wf_id,
-            task_queue=TASK_QUEUE,
-        )
-        return {"status": "accepted", "workflow_id": wf_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/enrichiq/writeback")
-async def enrichiq_writeback(payload: EnrichIQWriteback, request: Request):
-    try:
-        meta = payload.meta or {}
-        entity_id = meta.get("entity_id")
-        target_crm = meta.get("target_crm", "integritasmrv")
-        source_system = meta.get("source_system", "hubspot")
-        entity_type = meta.get("entity_type", "contact")
-        external_ids = meta.get("external_ids", {})
-
-        if not entity_id:
-            raise HTTPException(status_code=400, detail="entity_id required in meta")
-
-        enriched_data = {
-            "entity_attributes": payload.entity or {},
-            "enrichment_score": payload.trusted_attributes.get("enrichment_score"),
-            "last_enriched_at": payload.trusted_attributes.get("last_enriched_at"),
-        }
-
-        wf_id = f"writeback-enrichiq-{entity_id}"
-        client = await Client.connect(TEMPORAL_ADDR)
-        await client.start_workflow(
-            "WritebackWorkflow",
-            {
-                "entity_id": entity_id,
-                "target_crm": target_crm,
-                "source_system": source_system,
-                "entity_type": entity_type,
-                "enriched_data": enriched_data,
-                "external_ids": external_ids,
-            },
-            id=wf_id,
-            task_queue=TASK_QUEUE,
-        )
-        return {"status": "accepted", "workflow_id": wf_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 async def query_rag(query: str) -> str:
     try:
@@ -201,7 +173,6 @@ async def query_rag(query: str) -> str:
         print(f"RAG error: {e}")
     return ""
 
-
 async def post_typing(account_id: int, conversation_id: int, typing: bool):
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -213,7 +184,6 @@ async def post_typing(account_id: int, conversation_id: int, typing: bool):
     except Exception as e:
         print(f"Typing indicator error: {e}")
 
-
 async def post_reply(account_id: int, conversation_id: int, message: str):
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
@@ -223,11 +193,9 @@ async def post_reply(account_id: int, conversation_id: int, message: str):
         )
         return resp
 
-
 @app.get("/chatwoot/webhook")
 async def chatwoot_webhook_get():
     return {"status": "ok"}
-
 
 @app.post("/chatwoot/webhook")
 async def chatwoot_webhook(request: Request):
@@ -256,34 +224,41 @@ async def chatwoot_webhook(request: Request):
         if not user_message or not conversation_id:
             return {"handled": False, "reason": f"missing data"}
         
-        # Post typing indicator immediately
         await post_typing(account_id, conversation_id, True)
         
-        # Fetch RAG in parallel (saves ~0.5-1s)
-        rag_context = await query_rag(user_message)
+        if not needs_retrieval(user_message):
+            rag_context = ""
+            print(f"QueryRouter: bypass RAG for: {user_message[:30]}")
+        else:
+            ck = cache_key(user_message, "rag")
+            cached = await get_cached(ck)
+            if cached:
+                rag_context = cached
+                print(f"Cache hit for: {user_message[:30]}")
+            else:
+                rag_context = await query_rag(user_message)
+                await set_cached(ck, rag_context)
         
-        system_prompt = f"""You are a helpful sales assistant for Belinus, a Belgian company specializing in battery storage and energy solutions. IMPORTANT: You ONLY discuss Belinus products and services. NEVER mention other companies or products.
+        system_prompt = f"""Je bent een behulpzame verkoopassistent voor Belinus, een Belgisch bedrijf gespecialiseerd in batterijopslag en energieoplossingen. IMPORTANT: Je bespreekt ALLEEN Belinus producten en diensten.
 
-RESPOND IN THE SAME LANGUAGE as the user's message (English, Dutch, or French).
+RESPONDEER IN DEZELFDE TAAL als de gebruiker (Nederlands, Engels of Frans).
 
-Products:
-- Energywall G1: Lithium-free residential energy storage using graphene supercapacitor technology
-- 50000 charge cycles, 99% round-trip efficiency
-- 10 year warranty, 25 year design life
-- Modular from 5kWh to 500kWh
+Producten:
+- Energywall G1: Lithium-vrije residentiële energieopslag met graf supercapacitor technologie
+- 50000 laadcycli, 99% round-trip efficiëntie
+- 10 jaar garantie, 25 jaar ontwerplevensduur
+- Modulair van 5kWh tot 500kWh
 
-About Belinus:
-- Belgian engineering company
-- Headquarters at Thor Park Genk, Belgium
+Over Belinus:
+- Belgisch ingenieursbureau
+- Hoofdkantoor op Thor Park Genk, België
 - Website: www.belinus.net
-- Founded 2015, acquired by RBD N.V. in 2024
+- Opgericht in 2015, overgenomen door RBD N.V. in 2024
 
-If the user wants to speak with a human, respond with exactly: [TRANSFER]
+Als de gebruiker een mens wil spreken, antwoord dan exact: [TRANSFER]
 
-Use Belinus information above AND context from knowledge base below.
-
-Context:
-{rag_context if rag_context else 'No context available.'}"""
+Context van kennisbank:
+{rag_context if rag_context else 'Geen specifieke context beschikbaar.'}"""
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -299,7 +274,7 @@ Context:
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_message}
                         ],
-                        "max_tokens": 200,
+                        "max_tokens": 150,
                         "temperature": 0.1
                     }
                 )
@@ -317,17 +292,13 @@ Context:
         except Exception as e:
             import traceback
             print(f"LLM error: {type(e).__name__}: {e}")
-            print(f"Trace: {traceback.format_exc()[:200]}")
             ai_response = "Ik heb even geen antwoord. Een mens zal zo snel mogelijk reageren."
             should_handoff = True
         
-        # Stop typing indicator
         await post_typing(account_id, conversation_id, False)
         
         try:
-            # Use the admin API token directly
             headers = {"api_access_token": "3JGewDYGGD78t7s1zB4rbskk", "Content-Type": "application/json"}
-            
             async with httpx.AsyncClient(timeout=10.0) as client:
                 if should_handoff:
                     await client.patch(
@@ -335,16 +306,14 @@ Context:
                         headers=headers,
                         json={"status": "open"}
                     )
-                
                 await client.post(
                     f"https://chat.belinus.net/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
                     headers=headers,
                     json={"content": ai_response, "message_type": "outgoing"}
                 )
-                print(f"Chatwoot response sent: {ai_response[:50]}")
+                print(f"Response sent: {ai_response[:50]}")
         except Exception as e:
-            import traceback
-            print(f"Chatwoot post error: {type(e).__name__}: {e}")
+            print(f"Chatwoot post error: {e}")
         
         return {"handled": True, "reply": ai_response, "handoff": should_handoff}
         
@@ -352,11 +321,52 @@ Context:
         print(f"Webhook error: {e}")
         return {"handled": False, "error": str(e)}
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "temporal": TEMPORAL_ADDR, "namespace": "Integritasmrv"}
 
+@app.post("/ask")
+async def ask(body: AskRequest):
+    query = body.query
+    
+    if not needs_retrieval(query):
+        rag_context = ""
+        print(f"QueryRouter: bypass RAG for: {query[:30]}")
+    else:
+        ck = cache_key(query, "rag")
+        cached = await get_cached(ck)
+        if cached:
+            rag_context = cached
+            print(f"Cache hit for: {query[:30]}")
+        else:
+            rag_context = await query_rag(query)
+            await set_cached(ck, rag_context)
+    
+    context_text = f"Context:\n{rag_context}\n\n" if rag_context else ""
+    prompt = f"""{context_text}Question: {query}
+
+Answer concisely in the same language as the question (EN/NL/FR)."""
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "http://10.0.4.19:4000/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer sk-litellm-aifabric-secret",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "minimax-m2.7",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1
+                }
+            )
+            data = resp.json()
+            answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {"answer": answer, "context_used": bool(rag_context)}
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
