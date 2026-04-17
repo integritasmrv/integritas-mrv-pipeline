@@ -17,9 +17,9 @@ REDIS_HOST = "10.0.4.27"
 REDIS_PORT = 6379
 CACHE_TTL = 3600
 
-MODELS = ["minimax-m2.7", "gpu/qwen2.5-32b"]
-MAX_RETRIES = 2
-LLM_TIMEOUT = 30.0
+MODELS = ["minimax-m2.7", "fast-local", "qwen2.5-14b"]
+MAX_RETRIES = 1
+LLM_TIMEOUT = 15.0
 
 DIRECT_PATTERNS = [
     r"^(hi|hello|hey|bonjour|salut|hallo|goededag|goeie|bonsoir)",
@@ -110,14 +110,12 @@ async def call_llm(prompt: str, model: str) -> Tuple[Optional[str], bool]:
         return None, True
 
 async def get_llm_response(prompt: str) -> Optional[str]:
-    for attempt in range(MAX_RETRIES):
-        for model in MODELS:
-            result, should_retry = await call_llm(prompt, model)
-            if result:
-                return result
-            if not should_retry:
-                break
-            await asyncio.sleep(0.5 * (attempt + 1))
+    for model in MODELS:
+        result, should_retry = await call_llm(prompt, model)
+        if result:
+            return result
+        if not should_retry:
+            break
     fallback = "Bedankt voor je bericht! Een van onze teamleden neemt snel contact op."
     print(f"All models failed, using fallback")
     return fallback
