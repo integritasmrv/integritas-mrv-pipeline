@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Tuple
 import asyncio
 import time
 import re
@@ -16,6 +16,10 @@ TASK_QUEUE = "integritasmrv-ingest"
 REDIS_HOST = "10.0.4.27"
 REDIS_PORT = 6379
 CACHE_TTL = 3600
+
+MODELS = ["minimax-m2.7", "gpu/qwen2.5-32b"]
+MAX_RETRIES = 2
+LLM_TIMEOUT = 30.0
 
 DIRECT_PATTERNS = [
     r"^(hi|hello|hey|bonjour|salut|hallo|goededag|goeie|bonsoir)",
@@ -54,14 +58,69 @@ async def set_cached(key: str, value: str):
     except:
         pass
 
-def extract_llm_response(data: dict) -> str:
-    msg = data.get("choices", [{}])[0].get("message", {})
-    ai_response = msg.get("content", "").strip()
-    if not ai_response:
-        ai_response = msg.get("reasoning_content", "").strip()
-    if not ai_response:
-        ai_response = msg.get("provider_specific_fields", {}).get("reasoning_content", "").strip()
-    return ai_response
+def extract_llm_response(data: dict) -> Optional[str]:
+    try:
+        choices = data.get("choices", [{}])
+        if not choices:
+            return None
+        msg = choices[0].get("message", {})
+        content = msg.get("content")
+        if content and content.strip():
+            return content.strip()
+        rc = msg.get("reasoning_content")
+        if rc and rc.strip():
+            return rc.strip()
+        psf = msg.get("provider_specific_fields", {})
+        if isinstance(psf, dict):
+            rc2 = psf.get("reasoning_content")
+            if rc2 and rc2.strip():
+                return rc2.strip()
+        return None
+    except Exception as e:
+        print(f"extract_llm_response error: {e}")
+        return None
+
+async def call_llm(prompt: str, model: str) -> Tuple[Optional[str], bool]:
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+            resp = await client.post(
+                "http://10.0.4.19:4000/v1/chat/completions",
+                headers={
+                    "Authorization": "Bearer sk-litellm-aifabric-secret",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.1
+                }
+            )
+            data = resp.json()
+            if data.get("error"):
+                print(f"LLM error on {model}: {data['error']}")
+                return None, True
+            result = extract_llm_response(data)
+            if result:
+                return result, False
+            print(f"Empty response from {model}, raw: {str(data)[:100]}")
+            return None, True
+    except Exception as e:
+        print(f"LLM call failed on {model}: {type(e).__name__}: {e}")
+        return None, True
+
+async def get_llm_response(prompt: str) -> Optional[str]:
+    for attempt in range(MAX_RETRIES):
+        for model in MODELS:
+            result, should_retry = await call_llm(prompt, model)
+            if result:
+                return result
+            if not should_retry:
+                break
+            await asyncio.sleep(0.5 * (attempt + 1))
+    fallback = "Bedankt voor je bericht! Een van onze teamleden neemt snel contact op."
+    print(f"All models failed, using fallback")
+    return fallback
 
 class HubspotPayload(BaseModel):
     source: str = "hubspot"
@@ -235,36 +294,9 @@ Als iemand een mens wil spreken, schrijf dan: [TRANSFER]
 Vraag: {user_message}
 Antwoord:"""
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                llm_resp = await client.post(
-                    "http://10.0.4.19:4000/v1/chat/completions",
-                    headers={
-                        "Authorization": "Bearer sk-litellm-aifabric-secret",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "minimax-m2.7",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 150,
-                        "temperature": 0.1
-                    }
-                )
-                data = llm_resp.json()
-                if data.get("error"):
-                    raise Exception(str(data["error"]))
-                
-                ai_response = extract_llm_response(data)
-                if not ai_response:
-                    ai_response = "Bedankt voor je bericht! Een van onze teamleden neemt snel contact op."
-                    handoff = True
-                else:
-                    handoff = "[TRANSFER]" in ai_response
-                    ai_response = ai_response.replace("[TRANSFER]", "").strip()
-        except Exception as e:
-            print(f"LLM error: {e}")
-            ai_response = "Bedankt voor je bericht! Een van onze teamleden neemt snel contact op."
-            handoff = True
+        ai_response = await get_llm_response(prompt)
+        handoff = "[TRANSFER]" in ai_response
+        ai_response = ai_response.replace("[TRANSFER]", "").strip()
         
         await post_typing(account_id, conversation_id, False)
         
@@ -312,26 +344,8 @@ async def ask(body: AskRequest):
 Vraag: {query}
 Antwoord kort en behulpzaam:"""
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "http://10.0.4.19:4000/v1/chat/completions",
-                headers={
-                    "Authorization": "Bearer sk-litellm-aifabric-secret",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "minimax-m2.7",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 150,
-                    "temperature": 0.1
-                }
-            )
-            data = resp.json()
-            ai_response = extract_llm_response(data)
-            return {"answer": ai_response, "context_used": bool(ctx), "cached": False}
-    except Exception as e:
-        return {"error": str(e)}
+    ai_response = await get_llm_response(prompt)
+    return {"answer": ai_response, "context_used": bool(ctx), "cached": False}
 
 if __name__ == "__main__":
     import uvicorn
