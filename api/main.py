@@ -54,6 +54,15 @@ async def set_cached(key: str, value: str):
     except:
         pass
 
+def extract_llm_response(data: dict) -> str:
+    msg = data.get("choices", [{}])[0].get("message", {})
+    ai_response = msg.get("content", "").strip()
+    if not ai_response:
+        ai_response = msg.get("reasoning_content", "").strip()
+    if not ai_response:
+        ai_response = msg.get("provider_specific_fields", {}).get("reasoning_content", "").strip()
+    return ai_response
+
 class HubspotPayload(BaseModel):
     source: str = "hubspot"
     data: dict
@@ -200,7 +209,6 @@ async def chatwoot_webhook(request: Request):
         
         await post_typing(account_id, conversation_id, True)
         
-        # Query Router - bypass RAG for simple queries
         if not needs_retrieval(user_message):
             rag_context = ""
             print(f"Router: bypass for '{user_message[:30]}'")
@@ -246,7 +254,7 @@ Antwoord:"""
                 if data.get("error"):
                     raise Exception(str(data["error"]))
                 
-                ai_response = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                ai_response = extract_llm_response(data)
                 if not ai_response:
                     ai_response = "Bedankt voor je bericht! Een van onze teamleden neemt snel contact op."
                     handoff = True
@@ -320,8 +328,8 @@ Antwoord kort en behulpzaam:"""
                 }
             )
             data = resp.json()
-            answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return {"answer": answer, "context_used": bool(ctx), "cached": False}
+            ai_response = extract_llm_response(data)
+            return {"answer": ai_response, "context_used": bool(ctx), "cached": False}
     except Exception as e:
         return {"error": str(e)}
 
