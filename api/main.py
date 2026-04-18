@@ -6,31 +6,31 @@ import time
 import re
 import hashlib
 import httpx
-from temporalio.client import Client
+import os
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="IntegritasMRV Chat + RAG")
 
-TEMPORAL_ADDR = "10.0.4.16:7233"
-TASK_QUEUE = "integritasmrv-ingest"
+HATCHET_TOKEN = os.environ.get("HATCHET_CLIENT_TOKEN", "eyJhbGciOiJFUzI1NiIsImtpZCI6IkRFOWxydyJ9.eyJhdWQiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJleHAiOjE3ODQzMTI1MzQsImdycGNfYnJvYWRjYXN0X2FkZHJlc3MiOiJoYXRjaGV0LWVuZ2luZTo3MDcwIiwiaWF0IjoxNzc2NTM2NTM0LCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJzZXJ2ZXJfdXJsIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgwIiwic3ViIjoiNzA3ZDA4NTUtODBhYi00ZTFmLWExNTYtZjFjNDU0NmNiZjUyIiwidG9rZW5faWQiOiI1Y2NhNTU1MS03ODYwLTQxYTQtODMzZC1lNTg0NTQ3YTM4MjAifQ.V6kV3M5OZB5xHhjtrIOCEs_rif78GhW5_yno6q9qnJgO4dCRnqY8UAgERVert3XYmgv5sf_g7_hhq_xjoDpisw")
+HATCHET_HOST = "144.91.126.111:7070"
 
-REDIS_HOST = "10.0.4.27"
+REDIS_HOST = "10.0.4.8"
 REDIS_PORT = 6379
 CACHE_TTL = 3600
 
-MODELS = ["minimax-m2.7", "fast-local", "qwen2.5-14b"]
-MAX_RETRIES = 1
-LLM_TIMEOUT = 15.0
-OLLAMA_DIRECT = "http://10.0.4.27:11434"
-OLLAMA_DIRECT_MODEL = "llama3.2:latest"
-OLLAMA_DIRECT_TIMEOUT = 10.0
+OLLAMA_URL = "http://10.0.4.10:11434"
+OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_TIMEOUT = 30.0
 
 DIRECT_PATTERNS = [
-    r"^(hi|hello|hey|bonjour|salut|hallo|goededag|goeie|bonsoir)",
-    r"^(merci|thanks|thank you|dank u|danke|bedankt)$",
-    r"^(ok|okay|yes|no|oui|non|ja)$",
-    r"^(goodbye|bye|tot ziens|à bientôt|adieu)$",
-    r"^(how are you|how do you do|ça va)$",
-    r"^what is your name$",
+    r"^(hi|hello|hey|bonjour|salut|hallo|goededag|goeie|bonsoir|hoi|goedendag)$",
+    r"^(merci|thanks|thank you|dank u|danke|bedankt|thx|gracias)$",
+    r"^(ok|okay|yes|no|oui|non|ja|yea|yeah|jep)$",
+    r"^(goodbye|bye|tot ziens|à bientôt|adieu|tot straks)$",
+    r"^(how are you|how do you do|ça va|hoe gaat het)$",
+    r"^(what is your name|who are you|wie ben je|wie zijn jullie)$",
+    r"^(see you|later|à plus)$",
 ]
 
 def needs_retrieval(query: str) -> bool:
@@ -46,7 +46,7 @@ def cache_key_fn(query: str, prefix: str = "rag") -> str:
 async def get_cached(key: str) -> Optional[str]:
     try:
         import redis
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, socket_timeout=1)
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, socket_timeout=2)
         cached = r.get(key)
         return cached.decode() if cached else None
     except:
@@ -56,99 +56,88 @@ async def get_cached(key: str) -> Optional[str]:
 async def set_cached(key: str, value: str):
     try:
         import redis
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, socket_timeout=1)
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, socket_timeout=2)
         r.setex(key, CACHE_TTL, value)
     except:
         pass
 
-def extract_llm_response(data: dict) -> Optional[str]:
+async def call_ollama(prompt: str) -> Optional[str]:
     try:
-        choices = data.get("choices", [{}])
-        if not choices:
-            return None
-        msg = choices[0].get("message", {})
-        content = msg.get("content")
-        if content and content.strip():
-            return content.strip()
-        rc = msg.get("reasoning_content")
-        if rc and rc.strip():
-            return rc.strip()
-        psf = msg.get("provider_specific_fields", {})
-        if isinstance(psf, dict):
-            rc2 = psf.get("reasoning_content")
-            if rc2 and rc2.strip():
-                return rc2.strip()
-        return None
-    except Exception as e:
-        print(f"extract_llm_response error: {e}")
-        return None
-
-async def call_llm(prompt: str, model: str) -> Tuple[Optional[str], bool]:
-    try:
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
             resp = await client.post(
-                "http://10.0.4.19:4000/v1/chat/completions",
-                headers={
-                    "Authorization": "Bearer sk-litellm-aifabric-secret",
-                    "Content-Type": "application/json"
-                },
+                f"{OLLAMA_URL}/api/generate",
                 json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 150,
-                    "temperature": 0.1
-                }
-            )
-            data = resp.json()
-            if data.get("error"):
-                print(f"LLM error on {model}: {str(data['error'])[:80]}")
-                return None, True
-            result = extract_llm_response(data)
-            if result:
-                return result, False
-            print(f"Empty response from {model}")
-            return None, True
-    except Exception as e:
-        print(f"LLM call failed on {model}: {type(e).__name__}: {str(e)[:60]}")
-        return None, True
-
-async def call_ollama_direct(prompt: str) -> Optional[str]:
-    try:
-        async with httpx.AsyncClient(timeout=OLLAMA_DIRECT_TIMEOUT) as client:
-            resp = await client.post(
-                f"{OLLAMA_DIRECT}/api/chat",
-                json={
-                    "model": OLLAMA_DIRECT_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
                     "stream": False,
-                    "options": {"num_predict": 80}
+                    "options": {
+                        "num_predict": 150,
+                        "temperature": 0.3,
+                        "top_p": 0.9
+                    }
                 }
             )
             data = resp.json()
-            content = data.get("message", {}).get("content", "").strip()
+            content = data.get("response", "").strip()
             if content:
                 return content
             return None
     except Exception as e:
-        print(f"Ollama direct failed: {type(e).__name__}: {str(e)[:60]}")
+        print(f"Ollama call failed: {type(e).__name__}: {str(e)[:80]}")
         return None
 
-async def get_llm_response(prompt: str) -> Optional[str]:
-    for model in MODELS:
-        result, should_retry = await call_llm(prompt, model)
-        if result:
-            return result
-        if not should_retry:
-            break
+def get_rule_based_response(query: str) -> Optional[str]:
+    q = query.lower()
+    if any(k in q for k in ['batterij','battery','opslag','storage','energywall']):
+        return "De Energywall G1 is lithium-vrij met 50000 laadcycli en 10 jaar garantie! Specs: 99% efficiëntie, modulair van 5kWh tot 500kWh."
+    if any(k in q for k in ['prijs','price','kost','kosten','offerte','quotation']):
+        return "Voor een offerte op maat, neem contact op via info@belinus.net of bel +32 XX XXX XX XX"
+    if any(k in q for k in ['contact','bereik','email','telefoon','phone','reach']):
+        return "Je kunt ons bereiken via info@belinus.net of bel +32 XX XXX XX XX"
+    if any(k in q for k in ['bedankt','dank','thanks','merci','graag','thx']):
+        return "Graag gedaan! Nog een vraag over onze batterijsystemen?"
+    if 'lithium' in q:
+        return "De Belinus batterij is lithium-VRIJ! We gebruiken grafeen supercapacitor technologie - duurzamer en veiliger dan lithium."
+    if any(k in q for k in ['garantie','warranty','jaar','year']):
+        return "Onze Energywall G1 komt met 10 jaar garantie! Dat is de beste in de industrie."
+    if any(k in q for k in ['cyclus','cycli','cycle','cycles']):
+        return "De Energywall G1 gaat tot 50000 laadcycli mee! Dat is 10x meer dan lithium batterijen."
+    if any(k in q for k in ['hallo','hi','hello','hoi','hey','goede','goedendag']):
+        return "Hallo! Welkom bij Belinus! Waarmee kan ik je helpen?"
+    if any(k in q for k in ['zon','zonne','solar','sun']):
+        return "Ja! De Energywall G1 integreert perfect met zonnepanelen voor energieopslag."
+    if any(k in q for k in ['effici','efficientie','efficiency']):
+        return "De Energywall G1 heeft 99% efficiëntie - een van de hoogste in de industrie!"
+    if any(k in q for k in ['modulair','modular','schaalbaar','scalable']):
+        return "Ons systeem is modulair van 5kWh tot 500kWh - perfect voor thuis of bedrijf!"
+    if any(k in q for k in ['belg','belgi','belgie']):
+        return "Belinus is een Belgisch bedrijf! We leveren door heel Europa."
+    if any(k in q for k in ['duurzaam','duurzame','sustainable','groen','green']):
+        return "Onze lithium-vrije technologie is duurzamer en veiliger voor het milieu!"
+    if any(k in q for k in ['veilig','veiligheid','safe','safety']):
+        return "Veiligheid eerst! Onze grafeen supercapacitor batterijen zijn brandveilig en niet explosief."
+    if any(k in q for k in ['install','installatie',' монтаж']):
+        return "We bieden professionele installatie. Neem contact op voor meer info via info@belinus.net"
+    if any(k in q for k in ['oppervlak','dak','roof','surface']):
+        return "Onze batterijsystemen zijn compact en geschikt voor diverse installatielocaties."
+    return None
+
+async def get_llm_response(prompt: str, query: str = "") -> str:
+    if query:
+        rule_response = get_rule_based_response(query)
+        if rule_response:
+            return rule_response
     
-    ollama_result = await call_ollama_direct(prompt)
+    ollama_result = await call_ollama(prompt)
     if ollama_result:
-        print(f"Ollama direct fallback worked")
         return ollama_result
     
-    fallback = "Hallo! 👋 Leuk dat je contact opneemt met Belinus! Ik help je graag. Stel gerust je vraag!"
-    print(f"All models failed, using friendly fallback")
-    return fallback
+    if query:
+        rule_response = get_rule_based_response(query)
+        if rule_response:
+            return rule_response
+    
+    return "Hallo! Ik help je graag met vragen over onze lithium-vrije batterijsystemen. Stel gerust je vraag!"
 
 class HubspotPayload(BaseModel):
     source: str = "hubspot"
@@ -176,64 +165,83 @@ class AskRequest(BaseModel):
 async def health():
     return {"status": "ok"}
 
+@app.post("/ingest/webform")
+async def ingest_webform(request: Request):
+    try:
+        body = await request.json()
+        first_name = body.get("first-name", "")
+        last_name = body.get("last-name", "")
+        email = body.get("your-email") or body.get("email", "unknown")
+        phone = body.get("phone", "")
+        company = body.get("company", "")
+        
+        wf_id = f"webform-{email}-{int(time.time())}"
+        
+        message = f"Name: {first_name} {last_name}, Email: {email}, Phone: {phone}, Company: {company}, Message: {body.get('message', '')}"
+        
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            r = await client.post(
+                "https://hatchet.integritasmrv.com/api/v1/events",
+                headers={
+                    "Authorization": f"Bearer {HATCHET_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "key": "cf7-lead",
+                    "payload": {"message": message}
+                }
+            )
+            print(f"[HATCHET] Response: {r.status_code}")
+        
+        if r.status_code in (200, 201, 202):
+            print(f"[HATCHET] Pushed cf7-lead: {wf_id}")
+            return {"status": "accepted", "workflow_id": wf_id, "engine": "hatchet"}
+        else:
+            return {"status": "error", "detail": f"Hatchet error: {r.status_code}"}
+    except Exception as e:
+        print(f"Webform error: {e}")
+        return {"status": "error", "detail": str(e)[:100]}
+
 @app.post("/webhook/hubspot")
 async def webhook_hubspot(request: Request):
     try:
         body = await request.json()
         print(f"[WEBHOOK] HubSpot event received", flush=True)
         
-        client = await Client.connect(TEMPORAL_ADDR)
-        business_key = body.get("objectId") or body.get("properties", {}).get("hs_object_id", "unknown")
+        email = body.get("properties", {}).get("email", {}).get("value", "")
+        firstname = body.get("properties", {}).get("firstname", {}).get("value", "")
+        lastname = body.get("properties", {}).get("lastname", {}).get("value", "")
+        company = body.get("properties", {}).get("company", {}).get("value", "")
+        phone = body.get("properties", {}).get("phone", {}).get("value", "")
         
-        await client.start_workflow(
-            "IngestWorkflow",
-            {
-                "source": "hubspot",
-                "mapping_name": "hubspot_to_crm",
-                "target_crm": "integritasmrv",
-                "business_key": str(business_key),
-                "data": body,
-            },
-            id=f"ingest-hubspot-{business_key}",
-            task_queue=TASK_QUEUE,
-        )
-        return {"status": "accepted", "workflow_id": f"ingest-hubspot-{business_key}"}
+        business_key = body.get("objectId") or "unknown"
+        
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            r = await client.post(
+                "https://hatchet.integritasmrv.com/api/v1/events",
+                headers={
+                    "Authorization": f"Bearer {HATCHET_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "key": "hubspot-sync",
+                    "payload": {
+                        "email": email,
+                        "firstname": firstname,
+                        "lastname": lastname,
+                        "company": company,
+                        "phone": phone
+                    }
+                }
+            )
+            if r.status_code in (200, 201, 202):
+                print(f"[HATCHET] Pushed hubspot-sync event: {business_key}")
+                return {"status": "accepted", "workflow_id": f"hubspot-{business_key}", "engine": "hatchet"}
+            else:
+                print(f"[HATCHET] Error: {r.status_code} - {r.text}")
+                return {"status": "error", "detail": f"Hatchet API error: {r.status_code}"}
     except Exception as e:
         print(f"HubSpot webhook error: {e}")
-        return {"status": "error", "detail": str(e)}
-
-@app.post("/ingest/webform")
-async def ingest_webform(request: Request):
-    try:
-        body = await request.json()
-        email = body.get("your-email") or body.get("email", "unknown")
-        client = await Client.connect(TEMPORAL_ADDR)
-        wf_id = f"webform-{email}-{int(time.time())}"
-        
-        await client.start_workflow(
-            "IngestWorkflow",
-            {
-                "source": "webform",
-                "mapping_name": "webform_to_crm",
-                "target_crm": "poweriq",
-                "business_key": f"{email}-{int(time.time())}",
-                "data": {
-                    "first_name": body.get("first-name", ""),
-                    "last_name": body.get("last-name", ""),
-                    "email": email,
-                    "phone": body.get("phone", ""),
-                    "company": body.get("company", ""),
-                    "company_website": body.get("company-website", ""),
-                    "job_title": body.get("function", ""),
-                    "message": body.get("message", ""),
-                },
-            },
-            id=wf_id,
-            task_queue=TASK_QUEUE,
-        )
-        return {"status": "accepted", "workflow_id": wf_id}
-    except Exception as e:
-        print(f"Webform error: {e}")
         return {"status": "error", "detail": str(e)}
 
 async def query_rag(query: str) -> str:
@@ -322,7 +330,7 @@ Als iemand een mens wil spreken, schrijf dan: [TRANSFER]
 Vraag: {user_message}
 Antwoord:"""
 
-        ai_response = await get_llm_response(prompt)
+        ai_response = await get_llm_response(prompt, user_message)
         handoff = "[TRANSFER]" in ai_response
         ai_response = ai_response.replace("[TRANSFER]", "").strip()
         
@@ -368,11 +376,18 @@ async def ask(body: AskRequest):
             ctx = await query_rag(query)
             await set_cached(ck, ctx)
     
-    prompt = f"""Context: {ctx if ctx else 'Geen specifieke context'}
+    prompt = f"""Je bent een behulpzame en vriendelijke verkoopassistent voor Belinus, een Belgisch bedrijf dat lithium-vrije batterijopslagsystemen maakt.
+
+Producten:
+- Energywall G1: Lithium-vrije thuisbatterij met grafeen supercapacitor technologie
+- 50000 laadcycli, 99% efficiëntie, 10 jaar garantie
+- Modulair: 5kWh tot 500kWh
+
+Context: {ctx if ctx else 'Geen specifieke context'}
 Vraag: {query}
 Antwoord kort en behulpzaam:"""
 
-    ai_response = await get_llm_response(prompt)
+    ai_response = await get_llm_response(prompt, query)
     return {"answer": ai_response, "context_used": bool(ctx), "cached": False}
 
 if __name__ == "__main__":
