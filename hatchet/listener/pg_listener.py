@@ -27,8 +27,12 @@ os.environ.setdefault("HATCHET_CLIENT_HOST_PORT", HATCHET_HOST)
 os.environ.setdefault("HATCHET_CLIENT_TLS_STRATEGY", "none")
 
 
+_hatchet = None
+
+
 async def main():
-    hatchet = Hatchet()
+    global _hatchet
+    _hatchet = Hatchet()
     log.info("Connecting to CRM database...")
     conn = await asyncpg.connect(CRM_DSN)
     log.info("Connected. Listening on channel: %s", CHANNEL)
@@ -68,7 +72,6 @@ def _on_notification(conn, pid, channel, payload):
     )
 
     try:
-        hatchet = Hatchet()
         workflow_input = {
             "company_id": str(company_id),
             "name": data.get("name") or "",
@@ -78,11 +81,8 @@ def _on_notification(conn, pid, channel, payload):
             "hubspot_id": data.get("hubspot_id"),
             "company_email": data.get("company_email"),
         }
-        result = hatchet.client.admin.run_workflow(
-            "enrichment-workflow",
-            json.dumps(workflow_input),
-        )
-        log.info("Pushed to Hatchet: id=%s run=%s", company_id, result)
+        result = _hatchet.event.push("enrichment-request", workflow_input)
+        log.info("Pushed to Hatchet: id=%s event_id=%s", company_id, getattr(result, "eventId", result))
     except Exception as exc:
         log.error("Failed to push to Hatchet: id=%s error=%s", company_id, exc)
 
