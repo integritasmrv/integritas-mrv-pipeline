@@ -1,0 +1,11 @@
+services:
+  syncthing:
+    image: syncthing/syncthing:latest
+    container_name: syncthing-s2
+    volumes:
+      - /opt/syncthing-s2/config:/var/syncthing/config
+      - /root/agent-workspace:/var/syncthing/data/agent-workspace
+    ports:
+      - "8385:8384"
+      - "22001:22000"
+    restart: unless-stopped
