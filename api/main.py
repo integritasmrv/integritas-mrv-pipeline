@@ -8,24 +8,13 @@ import hashlib
 import httpx
 import os
 import urllib3
-from hatchet import Hatchet
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="IntegritasMRV Chat + RAG")
 
 HATCHET_TOKEN = os.environ.get("HATCHET_CLIENT_TOKEN", "eyJhbGciOiJFUzI1NiIsImtpZCI6IkRFOWxydyJ9.eyJhdWQiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJleHAiOjE3ODQzMTI1MzQsImdycGNfYnJvYWRjYXN0X2FkZHJlc3MiOiJoYXRjaGV0LWVuZ2luZTo3MDcwIiwiaWF0IjoxNzc2NTM2NTM0LCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJzZXJ2ZXJfdXJsIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgwIiwic3ViIjoiNzA3ZDA4NTUtODBhYi00ZTFmLWExNTYtZjFjNDU0NmNiZjUyIiwidG9rZW5faWQiOiI1Y2NhNTU1MS03ODYwLTQxYTQtODMzZC1lNTg0NTQ3YTM4MjAifQ.V6kV3M5OZB5xHhjtrIOCEs_rif78GhW5_yno6q9qnJgO4dCRnqY8UAgERVert3XYmgv5sf_g7_hhq_xjoDpisw")
 HATCHET_HOST = os.environ.get("HATCHET_CLIENT_HOST_PORT", "10.0.20.1:7070")
-
-try:
-    hatchet_client = Hatchet(
-        namespace="default",
-        token=HATCHET_TOKEN,
-        port=HATCHET_HOST
-    )
-    print(f"[HATCHET] Client initialized: {hatchet_client.engine().url}")
-except Exception as e:
-    print(f"[HATCHET] Failed to initialize: {e}")
-    hatchet_client = None
+HATCHET_URL = f"http://{HATCHET_HOST}/api/v1/events"
 
 REDIS_HOST = "10.0.4.8"
 REDIS_PORT = 6379
@@ -164,16 +153,25 @@ async def ingest_webform(request: Request):
         
         message = f"Name: {first_name} {last_name}, Email: {email}, Phone: {phone}, Company: {company}, Message: {body.get('message', '')}"
         
-        if hatchet_client:
-            try:
-                hatchet_client.event_push("cf7-lead", {"message": message})
-                print(f"[HATCHET] Pushed cf7-lead via SDK: {wf_id}")
-                return {"status": "accepted", "workflow_id": wf_id, "engine": "hatchet"}
-            except Exception as he:
-                print(f"[HATCHET] SDK error: {he}")
-                return {"status": "error", "detail": f"Hatchet SDK error: {str(he)[:100]}"}
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            r = await client.post(
+                HATCHET_URL,
+                headers={
+                    "Authorization": f"Bearer {HATCHET_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "key": "cf7-lead",
+                    "payload": {"message": message}
+                }
+            )
+            print(f"[HATCHET] Response: {r.status_code} - {r.text[:100]}")
+        
+        if r.status_code in (200, 201, 202):
+            print(f"[HATCHET] Pushed cf7-lead: {wf_id}")
+            return {"status": "accepted", "workflow_id": wf_id, "engine": "hatchet"}
         else:
-            return {"status": "error", "detail": "Hatchet client not initialized"}
+            return {"status": "error", "detail": f"Hatchet error: {r.status_code}"}
     except Exception as e:
         print(f"Webform error: {e}")
         return {"status": "error", "detail": str(e)[:100]}
@@ -192,22 +190,30 @@ async def webhook_hubspot(request: Request):
         
         business_key = body.get("objectId") or "unknown"
         
-        if hatchet_client:
-            try:
-                hatchet_client.event_push("hubspot-sync", {
-                    "email": email,
-                    "firstname": firstname,
-                    "lastname": lastname,
-                    "company": company,
-                    "phone": phone
-                })
-                print(f"[HATCHET] Pushed hubspot-sync via SDK: {business_key}")
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            r = await client.post(
+                HATCHET_URL,
+                headers={
+                    "Authorization": f"Bearer {HATCHET_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "key": "hubspot-sync",
+                    "payload": {
+                        "email": email,
+                        "firstname": firstname,
+                        "lastname": lastname,
+                        "company": company,
+                        "phone": phone
+                    }
+                }
+            )
+            if r.status_code in (200, 201, 202):
+                print(f"[HATCHET] Pushed hubspot-sync event: {business_key}")
                 return {"status": "accepted", "workflow_id": f"hubspot-{business_key}", "engine": "hatchet"}
-            except Exception as he:
-                print(f"[HATCHET] SDK error: {he}")
-                return {"status": "error", "detail": f"Hatchet SDK error: {str(he)[:100]}"}
-        else:
-            return {"status": "error", "detail": "Hatchet client not initialized"}
+            else:
+                print(f"[HATCHET] Error: {r.status_code} - {r.text}")
+                return {"status": "error", "detail": f"Hatchet API error: {r.status_code}"}
     except Exception as e:
         print(f"HubSpot webhook error: {e}")
         return {"status": "error", "detail": str(e)}
