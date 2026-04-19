@@ -100,8 +100,7 @@ async def write_crm(company_id: str, enriched: dict):
         values.append(json.dumps(enriched.get("sources", [])))
 
         idx += 1
-        sets.append(f"last_enriched_at = ${idx}")
-        values.append("NOW()")
+        sets.append(f"last_enriched_at = NOW()")
 
         idx += 1
         sets.append(f"enrichment_locked_until = ${idx}")
@@ -116,7 +115,8 @@ async def write_crm(company_id: str, enriched: dict):
         values.append(enriched.get("run_id"))
 
         values.append(int(company_id))
-        sql = f"UPDATE nb_crm_customers SET {', '.join(sets)} WHERE id = ${1}"
+        where_idx = idx + 1
+        sql = f"UPDATE nb_crm_customers SET {', '.join(sets)} WHERE id = ${where_idx}"
         await conn.execute(sql, *values)
         log.info("Wrote enriched data to CRM: id=%s", company_id)
     finally:
@@ -246,7 +246,7 @@ async def enrich_company(input: EnrichInput, ctx: Context) -> EnrichOutput:
         return EnrichOutput(status="skipped", score=0, notes="already_busy", sources=[], hubspot_sync="skipped")
 
     enriched = await searxng_enrich(claimed["name"], claimed.get("country"), claimed.get("website"))
-    enriched["run_id"] = ctx.workflow_run_id()
+    enriched["run_id"] = ctx.workflow_run_id
 
     await write_crm(input.company_id, enriched)
 
