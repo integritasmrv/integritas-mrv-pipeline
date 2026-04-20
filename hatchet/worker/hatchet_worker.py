@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 T = os.environ.get(
     "HATCHET_CLIENT_TOKEN",
-    "eyJhbGciOiJFUzI1NiIsImtpZCI6IkRFOWxydyJ9.eyJhdWQiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJleHAiOjE3ODQzMTI1MzQsImdycGNfYnJvYWRjYXN0X2FkZHJlc3MiOiJoYXRjaGV0LWVuZ2luZTo3MDcwIiwiaWF0IjoxNzc2NTM2NTM0LCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJzZXJ2ZXJfdXJsIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgwIiwic3ViIjoiNzA3ZDA4NTUtODBhYi00ZTFmLWExNTYtZjFjNDU0NmNiZjUyIiwidG9rZW5faWQiOiI1Y2NhNTU1MS03ODYwLTQxYTQtODMzZC1lNTg0NTQ3YTM4MjAifQ.V6kV3M5OZB5xHhjtrIOCEs_rif78GhW5_yno6q9qnJgO4dCRnqY8UAgERVert3XYmgv5sf_g7_hhq_xjoDpisw",
+    "eyJhbGciOiJFUzI1NiIsImtpZCI6ImZ5cTd3QSJ9.eyJhdWQiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJleHAiOjE3ODQzNjU5MTUsImdycGNfYnJvYWRjYXN0X2FkZHJlc3MiOiJoYXRjaGV0LWVuZ2luZTo3MDcwIiwiaWF0IjoxNzc2NTg5OTE1LCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjgwODAiLCJzZXJ2ZXJfdXJsIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgwIiwic3ViIjoiNzA3ZDA4NTUtODBhYi00ZTFmLWExNTYtZjFjNDU0NmNiZjUyIiwidG9rZW5faWQiOiJiMDc5MTc4Zi02OGQ4LTRhMzQtYThlYy1kNzQ2YjE4OGZkMzcifQ.FKSllU33io3P3Dl4bsWvdxPQzHCnXmKpU3PK_vx27DhQvaYjMmFzB91UT2Jw82mvcolXtNBK9tSNP_KcabHCKw",
 )
 os.environ["HATCHET_CLIENT_TOKEN"] = T
 os.environ["HATCHET_CLIENT_HOST_PORT"] = os.environ.get("HATCHET_CLIENT_HOST_PORT", "127.0.0.1:7070")
@@ -27,13 +27,97 @@ hatchet = Hatchet()
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://144.91.126.111:3010")
 CRM_DSN = os.environ.get(
     "CRM_DSN",
-    "postgresql://integritasmrv_crm_user:oYxxPKRfAHAD263VSDcKmljKY0vInx2QTl6PooKoqmmiDops@crm-integritasmrv-db:5432/integritasmrv_crm",
+    "postgresql://integritasmrv_crm_user:Int3gr1t@smrv_S3cure_P@ssw0rd_2026@10.0.16.2:5432/integritasmrv_crm",
 )
 HS_TOKEN = os.environ.get("HUBSPOT_API_TOKEN", "")
 
+POWERIQ_HOST = os.environ.get("POWERIQ_DB_HOST", "10.0.20.2")
+POWERIQ_PORT = int(os.environ.get("POWERIQ_DB_PORT", "5432"))
+POWERIQ_USER = os.environ.get("POWERIQ_DB_USER", "poweriq_crm_user")
+POWERIQ_PASS = os.environ.get("POWERIQ_DB_PASS", "P0w3r1Q_CRM_S3cur3_P@ss_2026")
+POWERIQ_DB = os.environ.get("POWERIQ_DB_NAME", "poweriq_crm")
+
 
 async def get_crm_conn():
-    return await asyncpg.connect(CRM_DSN)
+    return await asyncpg.connect(
+        host="crm-integritasmrv-db",
+        port=5432,
+        user="integritasmrv_crm_user",
+        password="oYxxPKRfAHAD263VSDcKmljKY0vInx2QTl6PooKoqmmiDops",
+        database="integritasmrv_crm",
+        timeout=30,
+    )
+
+
+async def get_poweriq_conn():
+    return await asyncpg.connect(
+        host=POWERIQ_HOST,
+        port=POWERIQ_PORT,
+        user=POWERIQ_USER,
+        password=POWERIQ_PASS,
+        database=POWERIQ_DB,
+        timeout=30,
+    )
+
+
+async def insert_cf7_lead_to_poweriq(first_name: str, last_name: str, email: str, phone: str, company: str, message: str) -> int | None:
+    conn = await get_poweriq_conn()
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO nb_crm_leads (name, company, email, phone, source, status, description, extra)
+            VALUES ($1, $2, $3, $4, 'CF7 Webform', 'new', $5, $6::jsonb)
+            RETURNING id
+            """,
+            f"{first_name} {last_name}".strip(),
+            company,
+            email,
+            phone,
+            message,
+            json.dumps({"original_message": message}),
+        )
+        return row["id"] if row else None
+    except Exception as e:
+        log.error("Failed to insert CF7 lead to PowerIQ: %s", e)
+        return None
+    finally:
+        await conn.close()
+
+
+def parse_cf7_message(message: str) -> dict:
+    result = {
+        "first_name": "",
+        "last_name": "",
+        "email": "",
+        "phone": "",
+        "company": "",
+        "message": message,
+    }
+    
+    name_match = re.search(r'Name:\s*([^(]+)', message)
+    if name_match:
+        name_parts = name_match.group(1).strip().split()
+        if name_parts:
+            result["first_name"] = name_parts[0]
+            result["last_name"] = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+    
+    email_match = re.search(r'Email:\s*([^,]+)', message)
+    if email_match:
+        result["email"] = email_match.group(1).strip()
+    
+    phone_match = re.search(r'Phone:\s*([^,]+)', message)
+    if phone_match:
+        result["phone"] = phone_match.group(1).strip()
+    
+    company_match = re.search(r'Company:\s*([^,]+)', message)
+    if company_match:
+        result["company"] = company_match.group(1).strip()
+    
+    msg_match = re.search(r'Message:\s*(.+)$', message)
+    if msg_match:
+        result["message"] = msg_match.group(1).strip()
+    
+    return result
 
 
 async def claim_company(company_id: str) -> dict | None:
@@ -57,7 +141,27 @@ async def claim_company(company_id: str) -> dict | None:
         await conn.close()
 
 
-async def write_crm(company_id: str, enriched: dict):
+async def claim_contact(contact_id: str) -> dict | None:
+    conn = await get_crm_conn()
+    try:
+        row = await conn.fetchrow(
+            """
+            UPDATE nb_crm_contacts
+            SET enrichment_status='Enrichment Busy',
+                enrichment_locked_until=NOW() + INTERVAL '30 minutes',
+                enrichment_worker_id='hatchet-worker'
+            WHERE id = $1::bigint
+              AND enrichment_status IN ('To Be Enriched', 'Enrichment Failed')
+            RETURNING id, name, email, phone, title, linkedin, hubspot_id, company_id
+            """,
+            int(contact_id),
+        )
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def write_crm_company(company_id: str, enriched: dict):
     conn = await get_crm_conn()
     try:
         sets = ["website = $1", "domain = $2", "linkedin_url = $3",
@@ -76,36 +180,64 @@ async def write_crm(company_id: str, enriched: dict):
             enriched.get("founded_year"), enriched.get("sic_code"),
             enriched.get("company_email"),
             enriched.get("status", "Enriched Partial"),
-            enriched.get("score", 0), enriched.get("notes", ""),
+            enriched.get("score", 0),
+            enriched.get("notes", ""),
             json.dumps(enriched.get("sources", [])),
-            enriched.get("run_id"), int(company_id),
+            enriched.get("run_id"),
+            int(company_id),
         ]
         sql = f"UPDATE nb_crm_customers SET {', '.join(sets)} WHERE id = $17"
         await conn.execute(sql, *values)
-        log.info("Wrote enriched data to CRM: id=%s", company_id)
+        log.info("Wrote enriched company to CRM: id=%s", company_id)
     finally:
         await conn.close()
 
 
-async def write_hubspot(hubspot_id: str, enriched: dict, crm_id: str):
+async def write_crm_contact(contact_id: str, enriched: dict):
+    conn = await get_crm_conn()
+    try:
+        sets = ["email = $1", "phone = $2", "title = $3", "linkedin = $4",
+                "industry = $5", "enrichment_status = $6", "enrichment_score = $7",
+                "enrichment_notes = $8", "enrichment_source = $9::jsonb",
+                "last_enriched_at = NOW()", "enrichment_locked_until = NULL",
+                "enrichment_worker_id = NULL", "last_enrichment_run_id = $10"]
+        values = [
+            enriched.get("email"), enriched.get("phone"), enriched.get("title"),
+            enriched.get("linkedin"), enriched.get("industry"),
+            enriched.get("status", "Enriched Partial"),
+            enriched.get("score", 0),
+            enriched.get("notes", ""),
+            json.dumps(enriched.get("sources", [])),
+            enriched.get("run_id"),
+            int(contact_id),
+        ]
+        sql = f"UPDATE nb_crm_contacts SET {', '.join(sets)} WHERE id = $11"
+        await conn.execute(sql, *values)
+        log.info("Wrote enriched contact to CRM: id=%s", contact_id)
+    finally:
+        await conn.close()
+
+
+async def write_hubspot_company(hubspot_id: str, enriched: dict, crm_id: str):
     if not HS_TOKEN or not hubspot_id:
-        log.warning("HubSpot write-back skipped: token=%s hubspot_id=%s", bool(HS_TOKEN), hubspot_id)
+        log.warning("HubSpot company write-back skipped: token=%s hubspot_id=%s", bool(HS_TOKEN), hubspot_id)
         return "skipped"
 
     headers = {"Authorization": f"Bearer {HS_TOKEN}", "Content-Type": "application/json"}
-    props = {"enrichment_status_c": enriched.get("status", "")}
+    props = {}
     if enriched.get("website"):
         props["website"] = enriched["website"]
     if enriched.get("industry"):
         props["industry"] = enriched["industry"]
     if enriched.get("linkedin_url"):
         props["linkedin_company_page"] = enriched["linkedin_url"]
-    if crm_id:
-        props["crm_entity_id"] = str(crm_id)
     if enriched.get("company_logo_url"):
         props["company_logo_url"] = enriched["company_logo_url"]
     if enriched.get("domain"):
         props["domain"] = enriched["domain"]
+
+    if not props:
+        return "skipped_no_props"
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as c:
@@ -117,76 +249,98 @@ async def write_hubspot(hubspot_id: str, enriched: dict, crm_id: str):
             if r.status_code in (200, 204):
                 log.info("Updated HubSpot company: hubspot_id=%s", hubspot_id)
                 return "updated"
-            log.error("HubSpot update failed: %s %s", r.status_code, r.text[:200])
+            log.error("HubSpot company update failed: %s %s", r.status_code, r.text[:200])
             return f"error:{r.status_code}"
     except Exception as exc:
-        log.error("HubSpot write-back error: %s", exc)
+        log.error("HubSpot company write-back error: %s", exc)
         return f"error:{exc}"
 
 
-async def searxng_enrich(name: str, country: str | None, existing_website: str | None) -> dict:
-    sources = []
-    urls = []
+async def write_hubspot_contact(hubspot_id: str, enriched: dict, crm_id: str):
+    if not HS_TOKEN or not hubspot_id:
+        log.warning("HubSpot contact write-back skipped: token=%s hubspot_id=%s", bool(HS_TOKEN), hubspot_id)
+        return "skipped"
+
+    headers = {"Authorization": f"Bearer {HS_TOKEN}", "Content-Type": "application/json"}
+    props = {}
+    if enriched.get("linkedin"):
+        props["linkedin_company_page"] = enriched["linkedin"]
+    if enriched.get("title"):
+        props["jobtitle"] = enriched["title"]
+
+    if not props:
+        return "skipped_no_props"
+
     try:
-        params = {"q": f'"{name}" company {country or ""} official website'}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(12)) as c:
-            r = await c.get(f"{SEARXNG_URL}/search", params=params)
-            r.raise_for_status()
-            urls = re.findall(r'href="(https?://[^"#]+)"', r.text)
-        sources = [u for u in dict.fromkeys(urls) if "144.91.126" not in u][:5]
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as c:
+            r = await c.patch(
+                f"https://api.hubapi.com/crm/v3/objects/contacts/{hubspot_id}",
+                headers=headers,
+                json={"properties": props},
+            )
+            if r.status_code in (200, 204):
+                log.info("Updated HubSpot contact: hubspot_id=%s", hubspot_id)
+                return "updated"
+            log.error("HubSpot contact update failed: %s %s", r.status_code, r.text[:200])
+            return f"error:{r.status_code}"
     except Exception as exc:
-        log.error("SEARXNG search error: %s", exc)
+        log.error("HubSpot contact write-back error: %s", exc)
+        return f"error:{exc}"
 
-    enriched_website = existing_website
-    if not enriched_website and sources:
-        for u in sources:
-            low = u.lower()
-            if any(t in low for t in ["linkedin.com", "facebook.com", "twitter.com", "wikipedia"]):
-                continue
-            enriched_website = u.rstrip("/")
-            break
 
-    domain = None
-    if enriched_website:
-        from urllib.parse import urlparse
-        domain = urlparse(enriched_website).hostname
+async def searxng_search(query: str) -> list[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(
+                SEARXNG_URL + "/search",
+                params={"q": query, "format": "json", "engines": "google,bing"},
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                return results[:5]
+    except Exception as e:
+        log.error("SearXNG search error: %s", e)
+    return []
 
-    linkedin_url = None
-    for u in sources:
-        if "linkedin.com/company" in u.lower():
-            linkedin_url = u
-            break
 
-    score = 0
-    if existing_website or enriched_website:
-        score += 40
+async def searxng_enrich_company(company_name: str, country: str | None = None, website: str | None = None) -> dict:
+    query = company_name
     if country:
-        score += 10
-    score += min(40, len(sources) * 8)
-    if linkedin_url:
-        score += 10
-
-    status = "Enriched Complete" if score >= 80 and len(sources) >= 3 else "Enriched Partial"
-
-    return {
-        "website": enriched_website,
-        "domain": domain,
-        "linkedin_url": linkedin_url,
-        "sources": sources,
-        "score": min(score, 100),
-        "status": status,
-        "notes": f"urls={len(sources)} linkedin={'yes' if linkedin_url else 'no'} domain={'yes' if domain else 'no'}",
+        query += f" {country}"
+    if website:
+        query += f" site:{website}"
+    
+    results = await searxng_search(query)
+    
+    enriched = {
+        "status": "enriched",
+        "score": min(100, len(results) * 20),
+        "notes": "",
+        "sources": [r.get("url", "") for r in results if r.get("url")],
+        "website": website or "",
+        "linkedin_url": "",
+        "description": "",
     }
+    
+    for r in results:
+        url = r.get("url", "")
+        title = r.get("title", "").lower()
+        if "linkedin" in url:
+            enriched["linkedin_url"] = url
+        if "description" in r:
+            enriched["description"] = r["description"][:500]
+    
+    enriched["notes"] = f"Found {len(results)} results via SearXNG"
+    
+    return enriched
 
 
 class EnrichInput(BaseModel):
     company_id: str
-    name: str
+    name: str | None = None
     website: str | None = None
     country: str | None = None
-    industry: str | None = None
     hubspot_id: str | None = None
-    company_email: str | None = None
 
 
 class EnrichOutput(BaseModel):
@@ -197,54 +351,60 @@ class EnrichOutput(BaseModel):
     hubspot_sync: str
 
 
-enr_wf = hatchet.workflow(name="enrichment-workflow", input_validator=EnrichInput, on_events=["enrichment-request"])
+class ContactEnrichInput(BaseModel):
+    contact_id: str
+    name: str | None = None
+    email: str | None = None
+    hubspot_id: str | None = None
 
 
-@enr_wf.task(name="enrich-company")
-async def enrich_company(input: EnrichInput, ctx: Context) -> EnrichOutput:
-    log.info("Enrichment started: id=%s name=%s", input.company_id, input.name)
-
-    claimed = await claim_company(input.company_id)
-    if not claimed:
-        log.warning("Could not claim company id=%s — may already be busy", input.company_id)
-        return EnrichOutput(status="skipped", score=0, notes="already_busy", sources=[], hubspot_sync="skipped")
-
-    enriched = await searxng_enrich(claimed["name"], claimed.get("country"), claimed.get("website"))
-    enriched["run_id"] = ctx.workflow_run_id
-
-    await write_crm(input.company_id, enriched)
-
-    hubspot_sync = await write_hubspot(
-        claimed.get("hubspot_id") or input.hubspot_id,
-        enriched,
-        input.company_id,
-    )
-
-    log.info(
-        "Enrichment complete: id=%s status=%s score=%s hs=%s",
-        input.company_id, enriched["status"], enriched["score"], hubspot_sync,
-    )
-    return EnrichOutput(
-        status=enriched["status"],
-        score=enriched["score"],
-        notes=enriched["notes"],
-        sources=enriched["sources"],
-        hubspot_sync=hubspot_sync,
-    )
+class ContactEnrichOutput(BaseModel):
+    status: str
+    score: int
+    notes: str
+    sources: list[str]
+    hubspot_sync: str
 
 
 class LeadInput(BaseModel):
     message: str
 
+
 class LeadOutput(BaseModel):
     result: str
+    lead_id: int | None = None
+
 
 cf7_wf = hatchet.workflow(name="cf7-to-crm-workflow", input_validator=LeadInput, on_events=["cf7-lead"])
+
 
 @cf7_wf.task(name="process-lead")
 async def process_lead(input: LeadInput, ctx: Context) -> LeadOutput:
     log.info("CF7 lead: %s", input.message)
-    return LeadOutput(result=f"Processed: {input.message}")
+    
+    parsed = parse_cf7_message(input.message)
+    log.info("Parsed CF7 lead: name=%s %s, email=%s, company=%s",
+             parsed["first_name"], parsed["last_name"], parsed["email"], parsed["company"])
+    
+    if not parsed["email"] or "@" not in parsed["email"]:
+        log.warning("Invalid email, skipping CRM insert: %s", parsed["email"])
+        return LeadOutput(result=f"Skipped: invalid email", lead_id=None)
+    
+    lead_id = await insert_cf7_lead_to_poweriq(
+        first_name=parsed["first_name"],
+        last_name=parsed["last_name"],
+        email=parsed["email"],
+        phone=parsed["phone"],
+        company=parsed["company"],
+        message=parsed["message"],
+    )
+    
+    if lead_id:
+        log.info("Inserted CF7 lead into PowerIQ CRM: id=%d", lead_id)
+        return LeadOutput(result=f"Inserted: lead_id={lead_id}", lead_id=lead_id)
+    else:
+        log.error("Failed to insert CF7 lead into PowerIQ CRM")
+        return LeadOutput(result="Failed to insert", lead_id=None)
 
 
 class HubSpotInput(BaseModel):
@@ -254,11 +414,14 @@ class HubSpotInput(BaseModel):
     company: str | None = None
     phone: str | None = None
 
+
 class HubSpotOutput(BaseModel):
     hubspot_id: str | None = None
     status: str
 
+
 hs_wf = hatchet.workflow(name="hubspot-sync", input_validator=HubSpotInput, on_events=["hubspot-sync"])
+
 
 @hs_wf.task(name="sync-contact")
 async def sync_contact(input: HubSpotInput, ctx: Context) -> HubSpotOutput:
@@ -277,7 +440,97 @@ async def sync_contact(input: HubSpotInput, ctx: Context) -> HubSpotOutput:
         return HubSpotOutput(status=f"error:{r.status_code}")
 
 
-worker = hatchet.worker("integritas-worker", workflows=[cf7_wf, enr_wf, hs_wf])
+enr_wf = hatchet.workflow(name="enrichment-workflow", input_validator=EnrichInput, on_events=["enrichment-request"])
+
+
+@enr_wf.task(name="enrich-company")
+async def enrich_company(input: EnrichInput, ctx: Context) -> EnrichOutput:
+    log.info("Company enrichment started: id=%s name=%s", input.company_id, input.name)
+
+    claimed = await claim_company(input.company_id)
+    if not claimed:
+        log.warning("Could not claim company id=%s — may already be busy", input.company_id)
+        return EnrichOutput(status="skipped", score=0, notes="already_busy", sources=[], hubspot_sync="skipped")
+
+    enriched = await searxng_enrich_company(claimed["name"], claimed.get("country"), claimed.get("website"))
+    enriched["run_id"] = ctx.workflow_run_id
+
+    await write_crm_company(input.company_id, enriched)
+
+    hubspot_sync = await write_hubspot_company(
+        claimed.get("hubspot_id") or input.hubspot_id,
+        enriched,
+        input.company_id,
+    )
+
+    log.info(
+        "Company enrichment complete: id=%s status=%s score=%s hs=%s",
+        input.company_id, enriched["status"], enriched["score"], hubspot_sync,
+    )
+    return EnrichOutput(
+        status=enriched["status"],
+        score=enriched["score"],
+        notes=enriched["notes"],
+        sources=enriched["sources"],
+        hubspot_sync=hubspot_sync,
+    )
+
+
+contact_wf = hatchet.workflow(
+    name="contact-enrichment-workflow",
+    input_validator=ContactEnrichInput,
+    on_events=["contact-enrichment-request"],
+)
+
+
+@contact_wf.task(name="enrich-contact")
+async def enrich_contact(input: ContactEnrichInput, ctx: Context) -> ContactEnrichOutput:
+    log.info("Contact enrichment started: id=%s name=%s", input.contact_id, input.name)
+
+    claimed = await claim_contact(input.contact_id)
+    if not claimed:
+        log.warning("Could not claim contact id=%s — may already be busy", input.contact_id)
+        return ContactEnrichOutput(status="skipped", score=0, notes="already_busy", sources=[], hubspot_sync="skipped")
+
+    query = f"{claimed.get('name')} {claimed.get('email')}"
+    if claimed.get("company"):
+        query += f" {claimed['company']}"
+    results = await searxng_search(query)
+    
+    enriched = {
+        "status": "enriched",
+        "score": min(100, len(results) * 20),
+        "notes": f"Found {len(results)} results",
+        "sources": [r.get("url", "") for r in results if r.get("url")],
+        "email": claimed.get("email"),
+        "phone": claimed.get("phone"),
+        "title": claimed.get("title"),
+        "linkedin": claimed.get("linkedin"),
+        "run_id": ctx.workflow_run_id,
+    }
+
+    await write_crm_contact(input.contact_id, enriched)
+
+    hubspot_sync = await write_hubspot_contact(
+        claimed.get("hubspot_id") or input.hubspot_id,
+        enriched,
+        input.contact_id,
+    )
+
+    log.info(
+        "Contact enrichment complete: id=%s status=%s score=%s hs=%s",
+        input.contact_id, enriched["status"], enriched["score"], hubspot_sync,
+    )
+    return ContactEnrichOutput(
+        status=enriched["status"],
+        score=enriched["score"],
+        notes=enriched["notes"],
+        sources=enriched["sources"],
+        hubspot_sync=hubspot_sync,
+    )
+
+
+worker = hatchet.worker("integritas-worker", workflows=[cf7_wf, enr_wf, hs_wf, contact_wf])
 
 if __name__ == "__main__":
     log.info("Starting Hatchet worker...")
