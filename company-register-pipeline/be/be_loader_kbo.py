@@ -169,8 +169,7 @@ class KBOPipeline:
             pipeline_version='1.0',
             source_type='KBO',
             run_type='initial',
-            total_files=len(config.KBO_FILES),
-            extract_number=str(extract_num)
+            total_files=len(config.KBO_FILES)
         )
         self.monitor.start_run(extract_run_id)
         self.current_run_id = extract_run_id
