@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.db_utils import Database, DBConfig
 from common import config_be as config
