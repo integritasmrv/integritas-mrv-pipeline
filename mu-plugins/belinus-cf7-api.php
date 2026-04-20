@@ -1,55 +1,39 @@
 <?php
 /**
  * Plugin Name: Belinus CF7 to API
- * Description: Forwards Contact Form 7 submissions to the Belinus API
- * Version: 1.0
- * Author: IntegritasMRV
+ * Description: Captures CF7 submissions and forwards to PowerIQ CRM API
  */
+add_action('wpcf7_before_mail', 'belinus_before_mail', 10, 1);
+add_action('wpcf7_mail_sent', 'belinus_mail_sent', 10, 1);
+add_action('wpcf7_mail_failed', 'belinus_mail_failed', 10, 1);
 
-add_action('wpcf7_submit', 'belinus_forward_to_api', 10, 2);
-
-function belinus_forward_to_api($contact_form, $result) {
-    if ($result['status'] !== 'mail_sent') {
-        return;
-    }
-
-    $submission = WPCF7_Submission::get_instance();
-    if (!$submission) {
-        return;
-    }
-
-    $data = $submission->get_posted_data();
-    
-    $payload = array(
-        'first-name'   => isset($data['first-name']) ? sanitize_text_field($data['first-name']) : '',
-        'last-name'    => isset($data['last-name']) ? sanitize_text_field($data['last-name']) : '',
-        'your-email'   => isset($data['your-email']) ? sanitize_email($data['your-email']) : '',
-        'phone'        => isset($data['phone']) ? sanitize_text_field($data['phone']) : '',
-        'company'      => isset($data['company']) ? sanitize_text_field($data['company']) : '',
-        'message'      => isset($data['message']) ? sanitize_textarea_field($data['message']) : '',
+function belinus_capture_and_send() {
+    $s = WPCF7_Submission::get_instance();
+    if (!$s) { return false; }
+    $d = $s->get_posted_data();
+    if (empty($d)) { return false; }
+    $p = array(
+        'first-name' => isset($d['first-name']) ? sanitize_text_field($d['first-name']) : '',
+        'last-name' => isset($d['last-name']) ? sanitize_text_field($d['last-name']) : '',
+        'your-email' => isset($d['your-email']) ? sanitize_email($d['your-email']) : '',
+        'phone' => isset($d['phone']) ? sanitize_text_field($d['phone']) : '',
+        'company' => isset($d['company']) ? sanitize_text_field($d['company']) : '',
+        'company-website' => isset($d['company-website']) ? esc_url_raw($d['company-website']) : '',
+        'function' => isset($d['function']) ? sanitize_text_field($d['function']) : '',
+        'product-interest' => isset($d['product-interest']) ? sanitize_text_field($d['product-interest']) : '',
+        'message' => isset($d['message']) ? sanitize_textarea_field($d['message']) : '',
     );
-
-    if (empty($payload['first-name']) && isset($data['first_name'])) {
-        $payload['first-name'] = sanitize_text_field($data['first_name']);
-    }
-    if (empty($payload['last-name']) && isset($data['last_name'])) {
-        $payload['last-name'] = sanitize_text_field($data['last_name']);
-    }
-    if (empty($payload['your-email']) && isset($data['email'])) {
-        $payload['your-email'] = sanitize_email($data['email']);
-    }
-
     $api_url = 'http://144.91.126.111:15579/ingest/webform';
-    
-    $response = wp_safe_remote_post($api_url, array(
-        'method'      => 'POST',
-        'timeout'     => 30,
-        'redirection' => 5,
-        'httpversion' => '1.0',
-        'blocking'    => false,
-        'headers'     => array('Content-Type' => 'application/json'),
-        'body'        => json_encode($payload),
+    wp_remote_post($api_url, array(
+        'method' => 'POST',
+        'timeout' => 30,
+        'blocking' => false,
+        'headers' => array('Content-Type' => 'application/json'),
+        'body' => json_encode($p),
     ));
-
-    error_log('[Belinus CF7] Forwarded to API');
+    return true;
 }
+
+function belinus_before_mail($cf) { belinus_capture_and_send(); }
+function belinus_mail_sent($cf) { belinus_capture_and_send(); }
+function belinus_mail_failed($cf) { belinus_capture_and_send(); }
