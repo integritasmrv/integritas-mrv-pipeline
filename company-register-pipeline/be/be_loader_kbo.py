@@ -205,8 +205,6 @@ class KBOPipeline:
             else:
                 all_file_totals[csv_file] = 0
         
-        self.monitor.update_run_total_items(self.current_run_id, grand_total)
-        
         item_ids = {}
         for csv_file in config.KBO_FILES:
             csv_path = os.path.join(extract_folder, csv_file)
