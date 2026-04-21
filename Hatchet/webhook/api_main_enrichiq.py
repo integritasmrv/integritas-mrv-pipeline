@@ -44,8 +44,8 @@ CRM_HOSTS = {
         "database": "integritasmrv_crm",
     },
     "poweriq": {
-        "host": os.environ.get("CRM_POWERIQ_HOST", "127.0.0.1"),
-        "port": int(os.environ.get("CRM_POWERIQ_PORT", "15433")),
+        "host": os.environ.get("CRM_POWERIQ_HOST", "10.0.14.2"),
+        "port": int(os.environ.get("CRM_POWERIQ_PORT", "5432")),
         "user": "poweriq_crm_user",
         "password": "P0w3r1Q_CRM_S3cur3_P@ss_2026",
         "database": "poweriq_crm",
