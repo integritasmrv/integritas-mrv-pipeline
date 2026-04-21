@@ -37,13 +37,15 @@ DIRECT_PATTERNS = [
 
 CRM_HOSTS = {
     "integritasmrv": {
-        "host": "10.0.13.2", "port": 5432,
+        "host": os.environ.get("CRM_INTEGRITASMRV_HOST", "10.0.13.2"),
+        "port": int(os.environ.get("CRM_INTEGRITASMRV_PORT", "5432")),
         "user": "integritasmrv_crm_user",
         "password": "oYxxPKRfAHAD263VSDcKmljKY0vInx2QTl6PooKoqmmiDops",
         "database": "integritasmrv_crm",
     },
     "poweriq": {
-        "host": "10.0.14.2", "port": 5432,
+        "host": os.environ.get("CRM_POWERIQ_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("CRM_POWERIQ_PORT", "15433")),
         "user": "poweriq_crm_user",
         "password": "P0w3r1Q_CRM_S3cur3_P@ss_2026",
         "database": "poweriq_crm",
@@ -146,7 +148,7 @@ async def get_hubspot_owner_email(owner_id: str) -> str:
     if not owner_id or not HS_PAT:
         return ""
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
+        async with httpx.AsyncClient(timeout=5.0) as c:
             r = await c.get(
                 f"https://api.hubapi.com/crm/v3/owners/{owner_id}",
                 headers={"Authorization": f"Bearer {HS_PAT}", "Content-Type": "application/json"},
@@ -169,8 +171,11 @@ async def resolve_owner_email(evt: dict) -> str:
         props.get("hubspot_owner_id", {}).get("value") or
         ""
     )
-    if owner_id:
-        return await get_hubspot_owner_email(owner_id)
+    if owner_id and HS_PAT:
+        try:
+            return await asyncio.wait_for(get_hubspot_owner_email(owner_id), timeout=5.0)
+        except asyncio.TimeoutError:
+            print(f"[HUBSPOT] Owner lookup timed out for {owner_id}")
     return ""
 
 
