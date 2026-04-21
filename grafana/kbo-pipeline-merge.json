@@ -1,0 +1,269 @@
+{
+  "dashboard": {
+    "title": "KBO Pipeline Merge",
+    "uid": "kbo-pipeline-merge",
+    "version": 1,
+    "panels": [
+      {
+        "id": 1,
+        "title": "Summary",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT COALESCE(SUM(rows_count), 0) FROM public.pipeline_metrics WHERE operation = 'INSERT' AND extract_version = '276'"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "green", "value": null}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 2,
+        "title": "Added",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT COALESCE(SUM(rows_count), 0) FROM public.pipeline_metrics WHERE operation = 'INSERT' AND extract_version = '276'"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "blue", "value": null}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 3,
+        "title": "Updated",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT COALESCE(SUM(rows_count), 0) FROM public.pipeline_metrics WHERE operation = 'UPDATE' AND extract_version = '276'"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "yellow", "value": null}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 4,
+        "title": "Processed",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT COALESCE(SUM(rows_count), 0) FROM public.pipeline_metrics WHERE extract_version = '276'"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "green", "value": null}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 5,
+        "title": "By Table - Added vs Updated",
+        "type": "bargauge",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT table_name, operation, SUM(rows_count) as count FROM public.pipeline_metrics WHERE extract_version = '276' GROUP BY table_name, operation ORDER BY table_name"
+          }
+        ],
+        "options": {
+          "displayMode": "gradient",
+          "orientation": "horizontal",
+          "showUnfilled": true
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "decimals": 0
+          },
+          "overrides": [
+            {
+              "matcher": {"id": "byName", "options": "INSERT"},
+              "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]
+            },
+            {
+              "matcher": {"id": "byName", "options": "UPDATE"},
+              "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]
+            }
+          ]
+        }
+      },
+      {
+        "id": 6,
+        "title": "Progress - Enterprise",
+        "type": "gauge",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT (SELECT COUNT(*) FROM kbo_master.enterprise) as current, 1939808 as target"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "min": 0,
+            "max": 2000000,
+            "thresholds": {
+              "mode": "percentage",
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 50},
+                {"color": "green", "value": 90}
+              ]
+            }
+          }
+        },
+        "options": {
+          "showUnfilled": true
+        }
+      },
+      {
+        "id": 7,
+        "title": "Table Status",
+        "type": "table",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "table",
+            "rawSql": "SELECT pm.table_name, pm.extract_version, SUM(CASE WHEN pm.operation = 'INSERT' THEN pm.rows_count ELSE 0 END) as added, SUM(CASE WHEN pm.operation = 'UPDATE' THEN pm.rows_count ELSE 0 END) as updated, SUM(pm.rows_count) as total_processed, (SELECT COUNT(*) FROM kbo_master.enterprise e WHERE pm.table_name = 'enterprise') as current_count, (SELECT COUNT(*) FROM \"BE KBO 276\".kbo.enterprise e WHERE pm.table_name = 'enterprise') as source_count FROM public.pipeline_metrics pm WHERE pm.extract_version = '276' GROUP BY pm.table_name, pm.extract_version ORDER BY pm.table_name"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "decimals": 0
+          }
+        },
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "table_name": "Table",
+                "extract_version": "Version",
+                "added": "Added",
+                "updated": "Updated",
+                "total_processed": "Processed",
+                "current_count": "Master Count",
+                "source_count": "Source Count"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Timeline",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20},
+        "targets": [
+          {
+            "refId": "A",
+            "format": "time_series",
+            "rawSql": "SELECT date_trunc('minute', recorded_at) as time, operation, SUM(rows_count) as count FROM public.pipeline_metrics WHERE extract_version = '276' GROUP BY date_trunc('minute', recorded_at), operation ORDER BY time"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "showPoints": "auto"
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {"id": "byName", "options": "INSERT"},
+              "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]
+            },
+            {
+              "matcher": {"id": "byName", "options": "UPDATE"},
+              "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "yellow"}}]
+            }
+          ]
+        }
+      }
+    ],
+    "time": {
+      "from": "now-15m",
+      "to": "now"
+    },
+    "refresh": "5s",
+    "schemaVersion": 30,
+    "version": 1,
+    "gnetId": null
+  },
+  "apiVersion": 1
+}
