@@ -4,10 +4,17 @@ Production Pipeline for Company Register Data
 =============================================
 Simple, fast COPY-based merge.
 Strategy: COPY to staging -> DELETE matching -> INSERT FROM staging
+
+FIXES APPLIED:
+- Proper quoting of uppercase column names in COPY SELECT
+- Case-insensitive column mapping between source (uppercase) and master (lowercase)
+- Correct PK matching for DELETE/INSERT
+- Using csv.writer for proper CSV export instead of manual string building
 """
 import sys
 import os
 import logging
+import csv
 from datetime import datetime
 import psycopg2
 
@@ -62,7 +69,6 @@ def init_master():
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS kbo_master")
         
-        # Create tables with lowercase columns
         cur.execute("""CREATE TABLE IF NOT EXISTS kbo_master.enterprise (
             enterprisenumber VARCHAR(20) PRIMARY KEY, status VARCHAR(2),
             juridicalsituation VARCHAR(10), typeofenterprise VARCHAR(3),
@@ -88,7 +94,6 @@ def init_master():
         cur.execute("""CREATE TABLE IF NOT EXISTS kbo_master.code (
             entitynumber VARCHAR(20) PRIMARY KEY, type VARCHAR(50), code VARCHAR(50))""")
 
-        # State and metrics tables
         cur.execute("""CREATE TABLE IF NOT EXISTS public.pipeline_state (
             id SERIAL PRIMARY KEY, extract_version VARCHAR(50) UNIQUE NOT NULL,
             status VARCHAR(20) DEFAULT 'pending', load_started_at TIMESTAMP,
@@ -238,36 +243,38 @@ def merge_extract(label):
             
             logger.info(f"Merging {master_table}...")
 
-            # Get source columns
             with version_conn.cursor() as cur:
                 schema, tbl = version_table.split('.')
                 cur.execute("""SELECT column_name FROM information_schema.columns 
                     WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
                 src_cols = [r[0] for r in cur.fetchall()]
 
-            # Get source count
             with version_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {version_table}")
                 source_count = cur.fetchone()[0]
             
-            # Get master count before
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_before = cur.fetchone()[0]
 
             logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
 
-            # Export to CSV
             temp_file = f'/tmp/{table_name}_merge.csv'
+            
             with version_conn.cursor() as cur:
-                cur.execute(f"COPY (SELECT {', '.join(src_cols)} FROM {version_table}) TO STDOUT WITH (FORMAT CSV, HEADER, DELIMITER ',')")
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    for row in cur:
-                        f.write(','.join(str(v) if v is not None else '' for v in row) + '\n')
+                cols_quoted = ['"' + c + '"' for c in src_cols]
+                copy_sql = f"COPY (SELECT {', '.join(cols_quoted)} FROM {version_table}) TO STDOUT WITH (FORMAT CSV, HEADER, DELIMITER ',')"
+                with open(temp_file, 'w', encoding='utf-8', errors='replace', newline='') as f:
+                    writer = csv.writer(f, quoting=csv.QUOTE_ALL, delimiter=',')
+                    writer.writerow(src_cols)
+                    while True:
+                        rows = cur.fetchmany(50000)
+                        if not rows:
+                            break
+                        writer.writerows(rows)
 
             logger.info(f"  Exported to {temp_file}")
 
-            # Create temp table in master
             staging_table = f'kbo_merge_staging_{table_name}'
             with master_conn.cursor() as cur:
                 cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
@@ -275,39 +282,38 @@ def merge_extract(label):
                 cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
             master_conn.commit()
 
-            # COPY into staging
-            with open(temp_file, 'r', encoding='utf-8') as f:
+            with open(temp_file, 'r', encoding='utf-8', errors='replace') as f:
                 with master_conn.cursor() as cur:
-                    cur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV, HEADER, DELIMITER ',', NULL '')", f)
+                    next(f)
+                    cur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV, DELIMITER ',', NULL '')", f)
             master_conn.commit()
             os.remove(temp_file)
 
-            # Get staging count
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
                 staging_count = cur.fetchone()[0]
             logger.info(f"  Staged: {staging_count:,}")
 
-            # Build DELETE + INSERT
             if pkeys:
-                # Build WHERE clause for matching rows
-                pk_idx = [src_cols.index(pk) for pk in pkeys if pk in src_cols]
-                where_parts = [f"m.col{pk_idx[i]} = s.col{pk_idx[i]}" for i in range(len(pk_idx))]
-                where_clause = ' AND '.join(where_parts)
+                pk_upper = [pk.upper() for pk in pkeys]
+                pk_idx = None
+                for i, col in enumerate(src_cols):
+                    if col.upper() in pk_upper:
+                        pk_idx = i
+                        break
                 
-                # Delete matching from master
-                with master_conn.cursor() as cur:
-                    cur.execute(f"""
-                        DELETE FROM {master_table} m
-                        WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {where_clause})
-                    """)
-                    deleted = cur.rowcount
-                master_conn.commit()
-                logger.info(f"  Deleted: {deleted:,}")
+                if pk_idx is not None:
+                    with master_conn.cursor() as cur:
+                        cur.execute(f"""DELETE FROM {master_table} 
+                            WHERE {pkeys[0]} IN (SELECT col{pk_idx} FROM {staging_table})""")
+                        deleted = cur.rowcount
+                    master_conn.commit()
+                    logger.info(f"  Deleted: {deleted:,}")
+                else:
+                    deleted = 0
             else:
                 deleted = 0
 
-            # Insert all from staging
             col_list = ', '.join([f'col{i}' for i in range(len(src_cols))])
             with master_conn.cursor() as cur:
                 cur.execute(f"INSERT INTO {master_table} SELECT {col_list} FROM {staging_table}")
@@ -315,17 +321,14 @@ def merge_extract(label):
             master_conn.commit()
             logger.info(f"  Inserted: {inserted:,}")
 
-            # Cleanup
             with master_conn.cursor() as cur:
                 cur.execute(f"DROP TABLE {staging_table}")
             master_conn.commit()
 
-            # Get final count
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_after = cur.fetchone()[0]
 
-            # Record metrics (total operations = source_count)
             with master_conn.cursor() as cur:
                 cur.execute("""INSERT INTO public.pipeline_metrics 
                     (extract_version, table_name, operation, rows_count) 
@@ -396,6 +399,9 @@ def show_status():
             UNION ALL SELECT 'address', COUNT(*) FROM kbo_master.address
             UNION ALL SELECT 'contact', COUNT(*) FROM kbo_master.contact
             UNION ALL SELECT 'activity', COUNT(*) FROM kbo_master.activity
+            UNION ALL SELECT 'denomination', COUNT(*) FROM kbo_master.denomination
+            UNION ALL SELECT 'branch', COUNT(*) FROM kbo_master.branch
+            UNION ALL SELECT 'code', COUNT(*) FROM kbo_master.code
             ORDER BY tbl""")
         for row in cur.fetchall():
             print(f"  {row[0]}: {row[1]:,}")
