@@ -2,10 +2,7 @@
 """
 Production Pipeline for Company Register Data
 =============================================
-Optimized for speed with large datasets:
-- Small tables (< 1M): INSERT...ON CONFLICT with metrics tracking
-- Large tables: STAGING + DELETE/INSERT (10x faster, batched)
-- Streaming exports to avoid memory issues
+Optimized for speed with large datasets.
 """
 import sys
 import os
@@ -22,7 +19,6 @@ DB_USER = os.getenv('DB_USER', 'aiuser')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'aipassword123')
 MASTER_DB = 'BE KBO MASTER'
 
-# Threshold for switching to fast merge strategy
 LARGE_TABLE_THRESHOLD = 1_000_000
 
 DATE_COLUMNS = {'startdate'}
@@ -69,8 +65,8 @@ def escape_csv_value(v):
     return s
 
 
-def get_master_columns(master_conn, table_name):
-    with master_conn.cursor() as cur:
+def get_master_columns(conn, table_name):
+    with conn.cursor() as cur:
         cur.execute("""SELECT column_name FROM information_schema.columns 
             WHERE table_schema = 'kbo_master' AND table_name = %s ORDER BY ordinal_position""", (table_name,))
         return [r[0].lower() for r in cur.fetchall()]
@@ -251,49 +247,40 @@ def load_extract(extract_path, label):
         raise
 
 
-def merge_table_fast(master_conn, version_conn, master_table, version_table, table_name, pkeys, date_cols, batch_size=50000):
-    """Fast merge using staging table + DELETE/INSERT strategy.
-    
-    Steps:
-    1. Create staging table with ONLY the PKs
-    2. INSERT PKs from source where PK NOT in master (find new records)
-    3. DELETE from master where PK in source (remove old versions)
-    4. INSERT ALL from source to master
-    5. Drop staging table
-    
-    This is much faster than ON CONFLICT DO UPDATE because:
-    - No per-row conflict checking
-    - Batched operations
-    - Minimal index updates
-    """
-    staging_table = f'kbo_staging_{table_name}'
-    
-    # Get master columns
-    master_cols = get_master_columns(master_conn, table_name)
-    master_cols_lower = [c.lower() for c in master_cols]
-    
-    # Get source columns
+def get_column_mapping(version_conn, version_table, master_conn, master_table):
+    """Build mapping from source (version) columns to master columns."""
     with version_conn.cursor() as cur:
         schema, tbl = version_table.split('.')
         cur.execute("""SELECT column_name FROM information_schema.columns 
             WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
         src_cols = [r[0] for r in cur.fetchall()]
     
-    if not src_cols:
-        return 0, 0
+    master_cols = get_master_columns(master_conn, master_table.split('.')[1])
+    master_cols_lower = [c.lower() for c in master_cols]
     
-    # Map source to master columns
-    col_mapping = {}
+    src_to_master = {}
     for src_col in src_cols:
         src_lower = src_col.lower()
         if src_lower in master_cols_lower:
             idx = master_cols_lower.index(src_lower)
-            col_mapping[src_col] = master_cols[idx]
+            src_to_master[src_col] = master_cols[idx]
+    
+    return src_cols, src_to_master
+
+
+def merge_table_fast(master_conn, version_conn, master_table, version_table, table_name, pkeys, date_cols, batch_size=50000):
+    """Fast merge using staging + DELETE/INSERT."""
+    staging_table = f'kbo_staging_{table_name}'
+    
+    src_cols, src_to_master = get_column_mapping(version_conn, version_table, master_conn, master_table)
+    
+    if not src_cols:
+        return 0, 0
+    
+    master_cols = list(src_to_master.values())
     
     pkeys_lower = [pk.lower() for pk in pkeys]
-    master_pkeys = [col_mapping.get(pk, pk) for pk in pkeys] if all(pk in col_mapping for pk in pkeys) else pkeys_lower
     
-    # Get counts before
     with master_conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {master_table}")
         master_before = cur.fetchone()[0]
@@ -304,98 +291,96 @@ def merge_table_fast(master_conn, version_conn, master_table, version_table, tab
     
     logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
     
-    # Count new records (PKs not in master)
+    # Create staging table with source columns
     with master_conn.cursor() as cur:
         cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
-        pk_list = ', '.join([f'"{p}"' for p in master_pkeys])
-        cur.execute(f"""
-            CREATE TABLE {staging_table} AS
-            SELECT {pk_list} FROM {version_table} v
-            WHERE NOT EXISTS (SELECT 1 FROM {master_table} m WHERE {pk_list.replace('"', 'm."').replace(',', '" AND m."')})
-        """)
-        cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
-        new_count = cur.fetchone()[0]
-    
-    logger.info(f"  New records: {new_count:,}")
-    
-    # Create staging with full data
-    with master_conn.cursor() as cur:
-        cur.execute(f"DROP TABLE {staging_table}")
-        cur.execute(f"""
-            CREATE TABLE {staging_table} AS
-            SELECT * FROM {version_table} v
-            WHERE 1=0
-        """)
+        col_defs = [f'"{c}" TEXT' for c in src_cols]
+        cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
     master_conn.commit()
     
     # Stream data into staging in batches
     with version_conn.cursor() as cur:
-        cur.execute(f"SELECT * FROM {version_table}")
+        cur.execute(f"SELECT {', '.join(src_cols)} FROM {version_table}")
         
+        total_staged = 0
         while True:
             rows = cur.fetchmany(batch_size)
             if not rows:
                 break
             
-            # Parse dates and filter to mapped columns
             batch = []
             for row in rows:
-                row_dict = dict(zip([c[0] for c in cur.description], row))
-                parsed_row = []
-                for col in src_cols:
-                    val = row_dict.get(col)
-                    master_col = col_mapping.get(col, col)
+                parsed = []
+                for col, val in zip(src_cols, row):
+                    master_col = src_to_master.get(col, col)
                     if master_col in date_cols and val:
                         val = parse_date(val) or val
-                    parsed_row.append(val)
-                batch.append(parsed_row)
+                    parsed.append(val)
+                batch.append(parsed)
             
-            # Insert batch into staging
             with master_conn.cursor() as mc:
                 placeholders = ', '.join(['%s'] * len(src_cols))
                 mc.executemany(f"INSERT INTO {staging_table} VALUES ({placeholders})", batch)
             master_conn.commit()
             
-            logger.info(f"  Staged {cur.rowcount:,} rows...")
+            total_staged += len(rows)
+            if total_staged % 100000 == 0:
+                logger.info(f"  Staged {total_staged:,}...")
     
-    # Now do the fast merge: DELETE + INSERT
-    logger.info(f"  Performing DELETE + INSERT merge...")
+    logger.info(f"  Total staged: {total_staged:,}")
     
-    # Get staging count
+    # Map staging columns to master columns for the insert
+    master_col_list = [src_to_master.get(c, c) for c in src_cols]
+    
+    # Count new records by checking which PKs from staging don't exist in master
+    pkey_eq_parts = [f's."{p}" = m."{p}"' for p in pkeys_lower]
+    pkey_eq = ' AND '.join(pkey_eq_parts)
+    
     with master_conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
-        staged_count = cur.fetchone()[0]
+        cur.execute(f"""
+            CREATE TABLE {staging_table}_newpk AS
+            SELECT s.* FROM {staging_table} s
+            WHERE NOT EXISTS (SELECT 1 FROM {master_table} m WHERE {pkey_eq})
+        """)
+        cur.execute(f"SELECT COUNT(*) FROM {staging_table}_newpk")
+        new_count = cur.fetchone()[0]
+    logger.info(f"  New PKs: {new_count:,}")
     
     # Delete matching PKs from master
     with master_conn.cursor() as cur:
-        pk_conditions = ' AND '.join([f'm."{p}" = s."{p}"' for p in master_pkeys])
         cur.execute(f"""
             DELETE FROM {master_table} m
-            WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {pk_conditions})
+            WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {pkey_eq})
         """)
         deleted = cur.rowcount
     master_conn.commit()
-    logger.info(f"  Deleted {deleted:,} old records")
+    logger.info(f"  Deleted: {deleted:,}")
     
     # Insert all from staging
+    staging_select = ', '.join([f'"{c}"' for c in src_cols])
+    master_insert = ', '.join([f'"{c}"' for c in master_col_list])
+    
     with master_conn.cursor() as cur:
-        cur.execute(f"INSERT INTO {master_table} SELECT * FROM {staging_table}")
+        cur.execute(f"""
+            INSERT INTO {master_table} ({master_insert})
+            SELECT {staging_select} FROM {staging_table}
+        """)
         inserted = cur.rowcount
     master_conn.commit()
-    logger.info(f"  Inserted {inserted:,} records")
+    logger.info(f"  Inserted: {inserted:,}")
     
-    # Cleanup
+    # Cleanup staging tables
     with master_conn.cursor() as cur:
         cur.execute(f"DROP TABLE {staging_table}")
+        cur.execute(f"DROP TABLE {staging_table}_newpk")
     master_conn.commit()
     
-    # Calculate metrics
     with master_conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {master_table}")
         master_after = cur.fetchone()[0]
     
     inserts = max(0, master_after - master_before)
-    updates = source_count - new_count  # Approximate
+    updates = deleted  # Approximate
     
     return inserts, updates
 
@@ -425,21 +410,20 @@ def merge_extract(label):
             table_name = master_table.split('.')[1]
             date_cols = DATE_TABLE_COLUMNS.get(table_name, [])
             
-            logger.info(f"Merging {master_table}...")
-            
-            # Get source count to decide strategy
             with version_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {version_table}")
                 source_count = cur.fetchone()[0]
             
+            logger.info(f"Merging {master_table} ({source_count:,} rows)...")
+            
             if source_count > LARGE_TABLE_THRESHOLD:
-                logger.info(f"  Using FAST merge (>{LARGE_TABLE_THRESHOLD:,} rows)...")
+                logger.info(f"  Using FAST merge (> {LARGE_TABLE_THRESHOLD:,})")
                 inserts, updates = merge_table_fast(
-                    master_conn, version_conn, master_table, version_table, 
+                    master_conn, version_conn, master_table, version_table,
                     table_name, pkeys, date_cols
                 )
             else:
-                logger.info(f"  Using standard merge ({source_count:,} rows)...")
+                logger.info(f"  Using standard merge")
                 inserts, updates = merge_table_standard(
                     master_conn, version_conn, master_table, version_table,
                     table_name, pkeys, date_cols
@@ -449,7 +433,6 @@ def merge_extract(label):
             total_updates += updates
             total_ops += source_count
             
-            # Record metrics
             with master_conn.cursor() as cur:
                 if inserts > 0:
                     cur.execute("""INSERT INTO public.pipeline_metrics 
@@ -489,27 +472,11 @@ def merge_extract(label):
 
 
 def merge_table_standard(master_conn, version_conn, master_table, version_table, table_name, pkeys, date_cols, batch_size=5000):
-    """Standard ON CONFLICT merge for small tables with proper metrics."""
+    """Standard ON CONFLICT merge for small tables."""
     staging_table = f'kbo_staging_{table_name}'
     
-    master_cols = get_master_columns(master_conn, table_name)
-    master_cols_lower = [c.lower() for c in master_cols]
-    
-    with version_conn.cursor() as cur:
-        schema, tbl = version_table.split('.')
-        cur.execute("""SELECT column_name FROM information_schema.columns 
-            WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
-        src_cols = [r[0] for r in cur.fetchall()]
-    
-    if not src_cols:
-        return 0, 0
-    
-    col_mapping = {}
-    for src_col in src_cols:
-        src_lower = src_col.lower()
-        if src_lower in master_cols_lower:
-            idx = master_cols_lower.index(src_lower)
-            col_mapping[src_col] = master_cols[idx]
+    src_cols, src_to_master = get_column_mapping(version_conn, version_table, master_conn, master_table)
+    master_cols = list(src_to_master.values())
     
     pkeys_lower = [pk.lower() for pk in pkeys]
     
@@ -524,13 +491,12 @@ def merge_table_standard(master_conn, version_conn, master_table, version_table,
     logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
     
     temp_file = f'/tmp/{staging_table}.csv'
-    select_cols = [c for c in src_cols if c in col_mapping]
     
     with version_conn.cursor() as cur:
-        cur.execute(f"SELECT {', '.join(select_cols)} FROM {version_table}")
+        cur.execute(f"SELECT {', '.join(src_cols)} FROM {version_table}")
         
         with open(temp_file, 'w', encoding='utf-8', errors='replace') as f:
-            master_select = [col_mapping[c] for c in select_cols]
+            master_select = [src_to_master.get(c, c) for c in src_cols]
             f.write(','.join([f'"{c}"' for c in master_select]) + '\n')
             
             while True:
@@ -540,8 +506,8 @@ def merge_table_standard(master_conn, version_conn, master_table, version_table,
                 
                 for row in rows:
                     parsed = []
-                    for col, val in zip(select_cols, row):
-                        master_col = col_mapping[col]
+                    for col, val in zip(src_cols, row):
+                        master_col = src_to_master.get(col, col)
                         if master_col in date_cols:
                             val = parse_date(val) or val
                         parsed.append(val)
@@ -599,8 +565,7 @@ def show_status():
     print("="*70)
 
     with conn.cursor() as cur:
-        cur.execute("""SELECT extract_version, status, records_loaded, records_merged, error_message, 
-            load_started_at, load_completed_at, merge_started_at, merge_completed_at 
+        cur.execute("""SELECT extract_version, status, records_loaded, records_merged, error_message 
             FROM public.pipeline_state ORDER BY extract_version""")
         for row in cur.fetchall():
             print(f"\nVersion {row[0]}: {row[1]}")
