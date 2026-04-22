@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 DB_HOST = os.getenv('DB_HOST', '127.0.0.1')
-DB_PORT = int(os.getenv('DB_PORT', '5432'))
+DB_PORT = int(os.getenv('DB_PORT', '5434'))
 DB_USER = os.getenv('DB_USER', 'aiuser')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'aipassword123')
 MASTER_DB = 'BE KBO MASTER'
