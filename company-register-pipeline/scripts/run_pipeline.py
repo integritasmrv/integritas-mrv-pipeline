@@ -2,23 +2,10 @@
 """
 Production Pipeline for Company Register Data
 =============================================
+Proper batching: smaller batches with individual commits for each batch.
+Never skips records - every source record is processed.
+
 Usage: python run_pipeline.py <command> [args]
-
-Commands:
-    python run_pipeline.py status                          - Show pipeline status
-    python run_pipeline.py <path> <label>                - Run full pipeline
-    python run_pipeline.py <path> <label> --load-only     - Load only
-    python run_pipeline.py <path> <label> --merge-only    - Merge only
-
-Examples:
-    python run_pipeline.py status
-    python run_pipeline.py '/mnt/win_data/BE/KBO/ExtractNumber 300' '300'
-
-This pipeline:
-1. Creates a versioned database (e.g., 'BE KBO 300') from CSV extract
-2. Merges the versioned data to the master database
-3. Tracks INSERT vs UPDATE metrics for each merge operation
-4. Idempotent - can resume from any step if interrupted
 """
 import sys
 import os
@@ -34,6 +21,9 @@ DB_PORT = int(os.getenv('DB_PORT', '5434'))
 DB_USER = os.getenv('DB_USER', 'aiuser')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'aipassword123')
 MASTER_DB = 'BE KBO MASTER'
+
+# Batch size: smaller batches = faster commits, better progress tracking
+BATCH_SIZE = 1000
 
 TABLES = [
     ("Enterprise.csv", "kbo_master.enterprise", "kbo.enterprise", ["EnterpriseNumber"]),
@@ -157,7 +147,7 @@ def create_version_db(label):
 
 
 def load_csv(conn, csv_path, table):
-    """Load CSV into table using COPY."""
+    """Load CSV into table using COPY - fast bulk load."""
     with open(csv_path, 'r', encoding='latin-1', errors='replace') as f:
         with conn.cursor() as cur:
             cur.copy_expert(f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER, DELIMITER E'\\t', NULL '')", f)
@@ -215,7 +205,11 @@ def load_extract(extract_path, label):
 
 
 def merge_extract(label):
-    """Merge versioned database to master with INSERT vs UPDATE tracking."""
+    """Merge versioned database to master with proper batching.
+    
+    Uses smaller batches (1000 rows) with individual commits.
+    Tracks INSERT vs UPDATE by counting before/after for each batch.
+    """
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
@@ -232,73 +226,126 @@ def merge_extract(label):
         master_conn.commit()
 
     total_ops = 0
+    total_inserts = 0
+    total_updates = 0
+    
     try:
         for csv_file, master_table, version_table, pkeys in TABLES:
             logger.info(f"Merging {master_table}...")
-
+            
+            # Get columns from version table
             with version_conn.cursor() as cur:
                 schema, tbl = version_table.split('.')
                 cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position", (schema, tbl))
                 cols = [r[0] for r in cur.fetchall()]
 
             if not cols:
+                logger.warning(f"No columns found for {version_table}")
                 continue
 
+            # Build merge SQL
             pk_str = ", ".join(pkeys)
             non_pk = [c for c in cols if c not in pkeys]
             update_set = ", ".join([f"{c}=EXCLUDED.{c}" for c in non_pk]) if non_pk else "nothing=NOTHING"
             col_list = ", ".join(cols)
             placeholders = ", ".join(["%s"] * len(cols))
-            merge_sql = f"INSERT INTO {master_table} ({col_list}) VALUES ({placeholders}) ON CONFLICT ({pk_str}) DO UPDATE SET {update_set}"
+            
+            merge_sql = f"""INSERT INTO {master_table} ({col_list}) 
+                            VALUES ({placeholders}) 
+                            ON CONFLICT ({pk_str}) DO UPDATE SET {update_set}"""
 
+            # Get table row counts before merge
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
-                before = cur.fetchone()[0]
+                master_before = cur.fetchone()[0]
 
+            with version_conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {version_table}")
+                version_total = cur.fetchone()[0]
+
+            logger.info(f"  Source: {version_total:,} rows, Master before: {master_before:,}")
+
+            # Process in smaller batches with individual commits
             version_cur = version_conn.cursor()
-            master_cur = master_conn.cursor()
+            version_cur.execute(f"SELECT {col_list} FROM {version_table} ORDER BY {pk_str}")
+
+            batch_num = 0
+            batch_inserts = 0
+            batch_updates = 0
             offset = 0
-            batch_size = 5000
-
+            
             while True:
-                version_cur.execute(f"SELECT {col_list} FROM {version_table} ORDER BY {pk_str} LIMIT {batch_size} OFFSET {offset}")
-                rows = version_cur.fetchmany(batch_size)
-                if not rows:
+                batch = version_cur.fetchmany(BATCH_SIZE)
+                if not batch:
                     break
-                master_cur.executemany(merge_sql, rows)
-                master_conn.commit()
-                offset += len(rows)
-                if offset % 50000 == 0:
-                    logger.info(f"  {offset:,} processed...")
 
+                # Get master count before this batch
+                with master_conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {master_table}")
+                    before_batch = cur.fetchone()[0]
+
+                # Execute batch with its own transaction
+                master_cur = master_conn.cursor()
+                master_cur.executemany(merge_sql, batch)
+                master_conn.commit()
+
+                # Get master count after this batch
+                with master_conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {master_table}")
+                    after_batch = cur.fetchone()[0]
+
+                # Calculate inserts vs updates for this batch
+                net_new = after_batch - before_batch
+                batch_insert = max(0, net_new)
+                batch_update = len(batch) - batch_insert
+                
+                batch_inserts += batch_insert
+                batch_updates += batch_update
+                offset += len(batch)
+                batch_num += 1
+
+                # Progress every 100 batches
+                if batch_num % 100 == 0:
+                    logger.info(f"  {offset:,}/{version_total:,} ({100*offset/version_total:.1f}%) - +{batch_insert:,} ins, +{batch_update:,} upd")
+
+            # Get final master count
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
-                after = cur.fetchone()[0]
+                master_after = cur.fetchone()[0]
 
-            inserts = max(0, after - before)
-            updates = offset - inserts
             table_name = master_table.split('.')[1]
-
+            
+            # Record metrics for this table
             with master_conn.cursor() as cur:
-                if inserts > 0:
-                    cur.execute("INSERT INTO public.pipeline_metrics (extract_version, table_name, operation, rows_count) VALUES (%s, %s, 'INSERT', %s)", (label, table_name, inserts))
-                if updates > 0:
-                    cur.execute("INSERT INTO public.pipeline_metrics (extract_version, table_name, operation, rows_count) VALUES (%s, %s, 'UPDATE', %s)", (label, table_name, updates))
+                if batch_inserts > 0:
+                    cur.execute("""INSERT INTO public.pipeline_metrics 
+                        (extract_version, table_name, operation, rows_count) 
+                        VALUES (%s, %s, 'INSERT', %s)""", (label, table_name, batch_inserts))
+                if batch_updates > 0:
+                    cur.execute("""INSERT INTO public.pipeline_metrics 
+                        (extract_version, table_name, operation, rows_count) 
+                        VALUES (%s, %s, 'UPDATE', %s)""", (label, table_name, batch_updates))
             master_conn.commit()
 
-            logger.info(f"  -> {inserts:,} INSERT, {updates:,} UPDATE")
+            logger.info(f"  {master_table}: {batch_inserts:,} INSERT, {batch_updates:,} UPDATE (total: {offset:,})")
+            total_inserts += batch_inserts
+            total_updates += batch_updates
             total_ops += offset
 
+        # Mark as merged
         with master_conn.cursor() as cur:
-            cur.execute("UPDATE public.pipeline_state SET status = 'merged', merge_completed_at = NOW(), records_merged = %s WHERE extract_version = %s", (total_ops, label))
+            cur.execute("""UPDATE public.pipeline_state 
+                SET status = 'merged', merge_completed_at = NOW(), records_merged = %s 
+                WHERE extract_version = %s""", (total_ops, label))
             master_conn.commit()
 
-        logger.info(f"Merge complete: {total_ops:,} total operations")
+        logger.info(f"Merge complete: {total_ops:,} total operations ({total_inserts:,} INSERT, {total_updates:,} UPDATE)")
         master_conn.close()
         version_conn.close()
         return True
 
     except Exception as e:
+        logger.error(f"Merge failed: {e}")
         with master_conn.cursor() as cur:
             cur.execute("UPDATE public.pipeline_state SET status = 'failed', error_message = %s WHERE extract_version = %s", (str(e), label))
             master_conn.commit()
@@ -315,19 +362,32 @@ def show_status():
     print("="*70)
 
     with conn.cursor() as cur:
-        cur.execute("SELECT extract_version, status, records_loaded, records_merged, error_message FROM public.pipeline_state ORDER BY extract_version")
+        cur.execute("""SELECT extract_version, status, records_loaded, records_merged, error_message, 
+            load_started_at, load_completed_at, merge_started_at, merge_completed_at 
+            FROM public.pipeline_state ORDER BY extract_version""")
         for row in cur.fetchall():
             print(f"\nVersion {row[0]}: {row[1]}")
             print(f"  Loaded: {row[2] or 0:,} records")
             print(f"  Merged: {row[3] or 0:,} records")
             if row[4]:
                 print(f"  Error: {row[4]}")
+            if row[5]:
+                print(f"  Load started: {row[5]}")
+            if row[6]:
+                print(f"  Load completed: {row[6]}")
+            if row[7]:
+                print(f"  Merge started: {row[7]}")
+            if row[8]:
+                print(f"  Merge completed: {row[8]}")
 
     print("\n" + "-"*70)
     print("METRICS (INSERT vs UPDATE)")
     print("-"*70)
     with conn.cursor() as cur:
-        cur.execute("SELECT extract_version, table_name, operation, SUM(rows_count) FROM public.pipeline_metrics GROUP BY extract_version, table_name, operation ORDER BY extract_version, table_name, operation")
+        cur.execute("""SELECT extract_version, table_name, operation, SUM(rows_count) 
+            FROM public.pipeline_metrics 
+            GROUP BY extract_version, table_name, operation 
+            ORDER BY extract_version, table_name, operation""")
         for row in cur.fetchall():
             print(f"  {row[0]}/{row[1]}/{row[2]}: {row[3]:,}")
 
@@ -347,6 +407,7 @@ def show_status():
         for row in cur.fetchall():
             print(f"  {row[0]}: {row[1]:,}")
     conn.close()
+    print()
 
 
 if __name__ == "__main__":
@@ -366,6 +427,7 @@ if __name__ == "__main__":
 
         logger.info(f"Pipeline for version {label}")
         logger.info(f"Extract path: {extract_path}")
+        logger.info(f"Batch size: {BATCH_SIZE}")
 
         init_master()
 
