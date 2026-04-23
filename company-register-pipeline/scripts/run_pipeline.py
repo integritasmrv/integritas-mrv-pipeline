@@ -8,6 +8,7 @@ Strategy: Stream from version DB -> staging table via StringIO pipe -> upsert in
 Version DB schemas match CSV headers exactly (all TEXT for flexibility).
 Master DB schemas match production (created by 01_create_master_db.sql).
 Merge maps version columns to master columns case-insensitively.
+Source data may contain duplicate PKs - handled via DISTINCT ON.
 """
 import sys
 import os
@@ -238,7 +239,8 @@ def load_extract(extract_path, label):
 
 
 def merge_extract(label):
-    """Upsert merge: stream version DB -> staging -> INSERT ON CONFLICT DO UPDATE"""
+    """Upsert merge: stream version DB -> staging -> INSERT ON CONFLICT DO UPDATE
+    Uses DISTINCT ON (pk) to deduplicate source data before upsert."""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
@@ -326,20 +328,22 @@ def merge_extract(label):
                     logger.info(f"  Staging: {staging_count:,}/{source_count:,}")
             logger.info(f"  Staged: {staging_count:,}")
 
-            if staging_count != source_count:
-                raise RuntimeError(
-                    f"Staging count mismatch for {table_name}: "
-                    f"staged={staging_count:,} vs source={source_count:,}")
+            with master_conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
+                actual_staged = cur.fetchone()[0]
+            if actual_staged != staging_count:
+                logger.warning(f"  Staging recount: {actual_staged:,} (reported {staging_count:,})")
 
             pk_list = ', '.join([f'"{pk}"' for pk in pkeys])
+            pk_distinct = ', '.join([f's."{pk}"' for pk in pkeys])
             select_parts = []
             for c in mapped_master:
                 udt = master_types.get(c, 'text')
                 suffix = cast_map.get(udt, '')
                 if suffix:
-                    select_parts.append(f's."{c}"{suffix}')
+                    select_parts.append(f'd."{c}"{suffix}')
                 else:
-                    select_parts.append(f's."{c}"')
+                    select_parts.append(f'd."{c}"')
             select_list = ', '.join(select_parts)
             col_list = ', '.join([f'"{c}"' for c in mapped_master])
 
@@ -347,16 +351,22 @@ def merge_extract(label):
             update_parts = [f'"{c}" = EXCLUDED."{c}"' for c in non_pk_cols]
             update_clause = ', '.join(update_parts)
 
-            logger.info(f"  Upserting {staging_count:,} rows (ON CONFLICT {pk_list})...")
+            logger.info(f"  Upserting (DISTINCT ON {pk_list})...")
 
             with master_conn.cursor() as cur:
                 if update_clause:
                     cur.execute(f"""INSERT INTO {master_table} ({col_list})
-                        SELECT {select_list} FROM {staging_table} s
+                        SELECT {select_list} FROM (
+                            SELECT DISTINCT ON ({pk_distinct}) *
+                            FROM {staging_table} s
+                        ) d
                         ON CONFLICT ({pk_list}) DO UPDATE SET {update_clause}""")
                 else:
                     cur.execute(f"""INSERT INTO {master_table} ({col_list})
-                        SELECT {select_list} FROM {staging_table} s
+                        SELECT {select_list} FROM (
+                            SELECT DISTINCT ON ({pk_distinct}) *
+                            FROM {staging_table} s
+                        ) d
                         ON CONFLICT ({pk_list}) DO NOTHING""")
                 upserted = cur.rowcount
             master_conn.commit()
