@@ -41,6 +41,7 @@ def get_conn(db):
     return psycopg2.connect(host=DB_HOST, port=DB_PORT, database=db, user=DB_USER, password=DB_PASSWORD)
 
 
+
 def init_master():
     logger.info("Initializing master database...")
     conn = get_conn("postgres")
@@ -51,6 +52,7 @@ def init_master():
     except psycopg2.errors.DuplicateDatabase:
         pass
     conn.close()
+
 
     conn = get_conn(MASTER_DB)
     with conn.cursor() as cur:
@@ -112,6 +114,7 @@ def create_version_db(label):
     finally:
         conn.close()
 
+
     conn = get_conn(dbname)
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS kbo")
@@ -121,8 +124,9 @@ def create_version_db(label):
                 JuridicalSituation VARCHAR(10), TypeOfEnterprise VARCHAR(3),
                 JuridicalForm VARCHAR(10), JuridicalFormCAC VARCHAR(10), StartDate VARCHAR(20))""",
             """CREATE TABLE kbo.establishment (
-                EstablishmentNumber VARCHAR(20) PRIMARY KEY, EnterpriseNumber VARCHAR(20),
-                StartDate VARCHAR(20), EntityNumber VARCHAR(20))""",
+                EstablishmentNumber VARCHAR(20) PRIMARY KEY,
+                StartDate VARCHAR(20),
+                EnterpriseNumber VARCHAR(20))""",
             """CREATE TABLE kbo.denomination (
                 EntityNumber VARCHAR(20) PRIMARY KEY, Denomination VARCHAR(500), Type VARCHAR(10), Language VARCHAR(3))""",
             """CREATE TABLE kbo.address (
@@ -153,24 +157,20 @@ def load_csv(conn, csv_path, table):
             cur.copy_expert(f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER, DELIMITER ',', NULL '')", f)
     conn.commit()
 
-
 def load_extract(extract_path, label):
     dbname = get_version_db(label)
     state_conn = get_conn(MASTER_DB)
-
     with state_conn.cursor() as cur:
         cur.execute("SELECT status FROM public.pipeline_state WHERE extract_version = %s", (label,))
         row = cur.fetchone()
         if row and row[0] in ('loaded', 'merging', 'merged'):
             logger.info(f"Version {label} already {row[0]}, skipping load")
             return False
-
     with state_conn.cursor() as cur:
         cur.execute("""INSERT INTO public.pipeline_state (extract_version, status, load_started_at)
             VALUES (%s, 'loading', NOW())
             ON CONFLICT (extract_version) DO UPDATE SET status = 'loading', load_started_at = NOW()""", (label,))
         state_conn.commit()
-
     try:
         create_version_db(label)
         total = 0
@@ -188,7 +188,6 @@ def load_extract(extract_path, label):
             conn.close()
             logger.info(f"  -> {cnt:,} rows")
             total += cnt
-
         with state_conn.cursor() as cur:
             cur.execute("UPDATE public.pipeline_state SET status = 'loaded', load_completed_at = NOW(), records_loaded = %s WHERE extract_version = %s", (total, label))
             state_conn.commit()
@@ -202,50 +201,38 @@ def load_extract(extract_path, label):
         state_conn.close()
         raise
 
-
 def merge_extract(label):
-    """Fast merge: COPY source -> staging -> DELETE+INSERT"""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
-
     with master_conn.cursor() as cur:
         cur.execute("SELECT status FROM public.pipeline_state WHERE extract_version = %s", (label,))
         row = cur.fetchone()
         if row and row[0] == 'merged':
             logger.info(f"Version {label} already merged, skipping")
             return False
-
     with master_conn.cursor() as cur:
         cur.execute("UPDATE public.pipeline_state SET status = 'merging', merge_started_at = NOW() WHERE extract_version = %s", (label,))
         master_conn.commit()
-
     total_ops = 0
     try:
         for csv_file, master_table, version_table in TABLES:
             table_name = master_table.split('.')[1]
             pkeys = PK_COLS.get(table_name, [])
-            
             logger.info(f"Merging {master_table}...")
-
             with version_conn.cursor() as cur:
                 schema, tbl = version_table.split('.')
                 cur.execute("""SELECT column_name FROM information_schema.columns 
                     WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
                 src_cols = [r[0] for r in cur.fetchall()]
-
             with version_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {version_table}")
                 source_count = cur.fetchone()[0]
-            
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_before = cur.fetchone()[0]
-
             logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
-
             temp_file = f'/tmp/{table_name}_merge.csv'
-            
             with version_conn.cursor() as cur:
                 cols_quoted = ['"' + c + '"' for c in src_cols]
                 copy_sql = f"COPY (SELECT {', '.join(cols_quoted)} FROM {version_table}) TO STDOUT WITH (FORMAT CSV, HEADER, DELIMITER ',')"
@@ -257,28 +244,23 @@ def merge_extract(label):
                         if not rows:
                             break
                         writer.writerows(rows)
-
             logger.info(f"  Exported to {temp_file}")
-
             staging_table = f'kbo_merge_staging_{table_name}'
             with master_conn.cursor() as cur:
                 cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
                 col_defs = [f'col{i} TEXT' for i in range(len(src_cols))]
                 cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
             master_conn.commit()
-
             with open(temp_file, 'r', encoding='utf-8', errors='replace') as f:
                 with master_conn.cursor() as cur:
                     next(f)
                     cur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV, DELIMITER ',', NULL '')", f)
             master_conn.commit()
             os.remove(temp_file)
-
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
                 staging_count = cur.fetchone()[0]
             logger.info(f"  Staged: {staging_count:,}")
-
             if pkeys:
                 pk_upper = [pk.upper() for pk in pkeys]
                 pk_idx = None
@@ -286,7 +268,6 @@ def merge_extract(label):
                     if col.upper() in pk_upper:
                         pk_idx = i
                         break
-                
                 if pk_idx is not None:
                     with master_conn.cursor() as cur:
                         cur.execute(f"""DELETE FROM {master_table} 
@@ -298,42 +279,34 @@ def merge_extract(label):
                     deleted = 0
             else:
                 deleted = 0
-
             col_list = ', '.join([f'col{i}' for i in range(len(src_cols))])
             with master_conn.cursor() as cur:
                 cur.execute(f"INSERT INTO {master_table} SELECT {col_list} FROM {staging_table}")
                 inserted = cur.rowcount
             master_conn.commit()
             logger.info(f"  Inserted: {inserted:,}")
-
             with master_conn.cursor() as cur:
                 cur.execute(f"DROP TABLE {staging_table}")
             master_conn.commit()
-
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_after = cur.fetchone()[0]
-
             with master_conn.cursor() as cur:
                 cur.execute("""INSERT INTO public.pipeline_metrics 
                     (extract_version, table_name, operation, rows_count) 
                     VALUES (%s, %s, 'MERGED', %s)""", (label, table_name, source_count))
             master_conn.commit()
-
             logger.info(f"  {master_table}: {source_count:,} merged ({deleted:,} replaced, {inserted:,} new net)")
             total_ops += source_count
-
         with master_conn.cursor() as cur:
             cur.execute("""UPDATE public.pipeline_state 
                 SET status = 'merged', merge_completed_at = NOW(), records_merged = %s 
                 WHERE extract_version = %s""", (total_ops, label))
             master_conn.commit()
-
         logger.info(f"Merge complete: {total_ops:,} total")
         master_conn.close()
         version_conn.close()
         return True
-
     except Exception as e:
         logger.error(f"Merge failed: {e}")
         import traceback
@@ -347,13 +320,11 @@ def merge_extract(label):
         version_conn.close()
         raise
 
-
 def show_status():
     conn = get_conn(MASTER_DB)
     print("\n" + "="*70)
     print("PIPELINE STATUS")
     print("="*70)
-
     with conn.cursor() as cur:
         cur.execute("""SELECT extract_version, status, records_loaded, records_merged, error_message 
             FROM public.pipeline_state ORDER BY extract_version""")
@@ -363,7 +334,6 @@ def show_status():
             print(f"  Merged: {row[3] or 0:,} records")
             if row[4]:
                 print(f"  Error: {row[4]}")
-
     print("\n" + "-"*70)
     print("METRICS")
     print("-"*70)
@@ -374,7 +344,6 @@ def show_status():
             ORDER BY extract_version, table_name""")
         for row in cur.fetchall():
             print(f"  {row[0]}/{row[1]}/{row[2]}: {row[3]:,}")
-
     print("\n" + "-"*70)
     print("MASTER TABLE COUNTS")
     print("-"*70)
@@ -393,14 +362,11 @@ def show_status():
     conn.close()
     print()
 
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-
     command = sys.argv[1]
-
     if command == "status":
         show_status()
     else:
@@ -408,16 +374,11 @@ if __name__ == "__main__":
         label = sys.argv[2]
         load_only = '--load-only' in sys.argv
         merge_only = '--merge-only' in sys.argv
-
         logger.info(f"Pipeline for version {label}")
         logger.info(f"Extract path: {extract_path}")
-
         init_master()
-
         if not merge_only:
             load_extract(extract_path, label)
-
         if not load_only:
             merge_extract(label)
-
         show_status()
