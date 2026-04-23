@@ -2,18 +2,18 @@
 """
 Production Pipeline for Company Register Data
 =============================================
-Simple, fast COPY-based merge.
-Strategy: COPY source -> staging -> DELETE matching -> INSERT FROM staging
+Fast COPY-based merge with atomic DELETE+INSERT.
+Strategy: Stream from version DB -> staging table via StringIO pipe -> atomic DELETE+INSERT
 
-Version DB schemas match CSV headers exactly (uppercase, all TEXT for flexibility).
+Version DB schemas match CSV headers exactly (all TEXT for flexibility).
 Master DB schemas match production (created by 01_create_master_db.sql).
-Merge maps version (uppercase) columns to master (lowercase) columns case-insensitively.
+Merge maps version columns to master columns case-insensitively.
 """
 import sys
 import os
 import logging
 import csv
-import time
+import io
 from datetime import datetime
 import psycopg2
 
@@ -238,16 +238,10 @@ def load_extract(extract_path, label):
 
 
 def merge_extract(label):
-    """Fast merge using dblink to stream data directly between databases.
-    Strategy per table:
-      1. Open dblink connection to version DB
-      2. SAVEPOINT for atomic DELETE+INSERT
-      3. DELETE matching rows from master (via EXISTS subquery with dblink)
-      4. INSERT INTO master SELECT FROM dblink
-      5. COMMIT (atomic - if INSERT fails, DELETE is rolled back too)
-    """
+    """Fast merge using in-memory StringIO pipe: stream from version DB -> staging -> atomic DELETE+INSERT"""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
+    version_conn = get_conn(dbname)
 
     with master_conn.cursor() as cur:
         cur.execute("SET session_replication_role = 'replica';")
@@ -264,38 +258,69 @@ def merge_extract(label):
         master_conn.commit()
     total_ops = 0
     try:
-        dblink_conn = f"dbname={dbname} host={DB_HOST} port={DB_PORT} user={DB_USER} password={DB_PASSWORD}"
         for csv_file, master_table, version_table in TABLES:
             table_name = master_table.split('.')[1]
             pkeys = PK_COLS.get(table_name, [])
             logger.info(f"Merging {master_table}...")
 
-            with master_conn.cursor() as cur:
-                cur.execute("SELECT * FROM dblink_connect('vmerge', %s)", (dblink_conn,))
-            master_conn.commit()
-
-            schema, tbl = version_table.split('.')
-            with master_conn.cursor() as cur:
+            with version_conn.cursor() as cur:
+                schema, tbl = version_table.split('.')
                 cur.execute("""SELECT column_name FROM information_schema.columns
-                    WHERE table_schema = 'kbo_master' AND table_name = %s ORDER BY ordinal_position""", (table_name,))
-                master_info_cols = cur.fetchall()
-                master_cols = [r[0] for r in master_info_cols]
+                    WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
+                src_cols = [r[0] for r in cur.fetchall()]
             with master_conn.cursor() as cur:
                 cur.execute("""SELECT column_name, udt_name FROM information_schema.columns
                     WHERE table_schema = 'kbo_master' AND table_name = %s ORDER BY ordinal_position""", (table_name,))
                 master_info = cur.fetchall()
+                master_cols = [r[0] for r in master_info]
                 master_types = {r[0]: r[1] for r in master_info}
+            master_cols_lower = {c.lower(): c for c in master_cols}
+            src_to_master = {}
+            for sc in src_cols:
+                if sc.lower() in master_cols_lower:
+                    src_to_master[sc] = master_cols_lower[sc.lower()]
+            mapped_src = [c for c in src_cols if c in src_to_master]
+            mapped_master = [src_to_master[c] for c in mapped_src]
+            logger.info(f"  Mapped {len(mapped_src)}/{len(src_cols)} cols: {mapped_master}")
 
-            vcols_quoted = ', '.join([f'"{c}"' for c in master_cols])
-            col_list = ', '.join([f'"{c}"' for c in master_cols])
-
-            with master_conn.cursor() as cur:
-                cur.execute(f"SELECT * FROM dblink('vmerge', 'SELECT count(*) FROM {version_table}') AS t(cnt bigint)")
+            with version_conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {version_table}")
                 source_count = cur.fetchone()[0]
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_before = cur.fetchone()[0]
             logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
+
+            staging_table = f'public.kbo_merge_staging_{table_name}'
+            with master_conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+                col_defs = [f'"{c}" TEXT' for c in mapped_master]
+                cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
+            master_conn.commit()
+            logger.info(f"  Created staging {staging_table}")
+
+            staging_count = 0
+            src_cols_quoted = [f'"{c}"' for c in mapped_src]
+            with version_conn.cursor(f'stream_{table_name}') as vcur:
+                vcur.execute(f"SELECT {', '.join(src_cols_quoted)} FROM {version_table}")
+                while True:
+                    rows = vcur.fetchmany(100000)
+                    if not rows:
+                        break
+                    buf = io.StringIO()
+                    csv.writer(buf, quoting=csv.QUOTE_ALL).writerows(rows)
+                    buf.seek(0)
+                    with master_conn.cursor() as mcur:
+                        mcur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV)", buf)
+                    master_conn.commit()
+                    staging_count += len(rows)
+                    logger.info(f"  Staging: {staging_count:,}/{source_count:,}")
+            logger.info(f"  Staged: {staging_count:,}")
+
+            if staging_count != source_count:
+                raise RuntimeError(
+                    f"Staging count mismatch for {table_name}: "
+                    f"staged={staging_count:,} vs source={source_count:,}")
 
             with master_conn.cursor() as cur:
                 cur.execute("SAVEPOINT merge_atomic;")
@@ -304,16 +329,9 @@ def merge_extract(label):
             if pkeys:
                 where_parts = [f'm."{pk}"::text = s."{pk}"' for pk in pkeys]
                 where_clause = ' AND '.join(where_parts)
-                pk_cols = ', '.join([f'"{pk}"' for pk in pkeys])
-                pk_types = ', '.join([f'"{pk}" {master_types.get(pk, "text")}' for pk in pkeys])
                 with master_conn.cursor() as cur:
                     cur.execute(f"""DELETE FROM {master_table} m
-                        WHERE EXISTS (
-                            SELECT 1 FROM dblink('vmerge',
-                                'SELECT {pk_cols} FROM {version_table}'
-                            ) AS s({pk_types})
-                            WHERE {where_clause}
-                        )""")
+                        WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {where_clause})""")
                     deleted = cur.rowcount
                 logger.info(f"  Deleted: {deleted:,}")
 
@@ -325,29 +343,26 @@ def merge_extract(label):
                 'numeric': '::numeric',
             }
             select_parts = []
-            dblink_col_defs = []
-            for c in master_cols:
+            for c in mapped_master:
                 udt = master_types.get(c, 'text')
                 suffix = cast_map.get(udt, '')
                 if suffix:
                     select_parts.append(f's."{c}"{suffix}')
                 else:
                     select_parts.append(f's."{c}"')
-                dblink_col_defs.append(f'"{c}" text')
             select_list = ', '.join(select_parts)
-            dblink_as = ', '.join(dblink_col_defs)
-
+            col_list = ', '.join([f'"{c}"' for c in mapped_master])
             with master_conn.cursor() as cur:
-                cur.execute(f"""INSERT INTO {master_table} ({col_list})
-                    SELECT {select_list}
-                    FROM dblink('vmerge',
-                        'SELECT {vcols_quoted} FROM {version_table}'
-                    ) AS s({dblink_as})""")
+                cur.execute(f"INSERT INTO {master_table} ({col_list}) SELECT {select_list} FROM {staging_table} s")
                 inserted = cur.rowcount
             logger.info(f"  Inserted: {inserted:,}")
 
             master_conn.commit()
             logger.info(f"  DELETE+INSERT committed atomically")
+
+            with master_conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+            master_conn.commit()
 
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
@@ -360,10 +375,6 @@ def merge_extract(label):
             logger.info(f"  {master_table}: {source_count:,} merged ({deleted:,} replaced, {inserted:,} new) -> {master_after:,}")
             total_ops += source_count
 
-            with master_conn.cursor() as cur:
-                cur.execute("SELECT dblink_disconnect('vmerge')")
-            master_conn.commit()
-
         with master_conn.cursor() as cur:
             cur.execute("""UPDATE public.pipeline_state
                 SET status = 'merged', merge_completed_at = NOW(), records_merged = %s
@@ -374,6 +385,7 @@ def merge_extract(label):
             cur.execute("SET session_replication_role = 'origin';")
         master_conn.commit()
         master_conn.close()
+        version_conn.close()
         return True
     except Exception as e:
         logger.error(f"Merge failed: {e}")
@@ -389,13 +401,8 @@ def merge_extract(label):
         with master_conn.cursor() as cur:
             cur.execute("UPDATE public.pipeline_state SET status = 'failed', error_message = %s WHERE extract_version = %s", (str(e)[:500], label))
             master_conn.commit()
-        try:
-            with master_conn.cursor() as cur:
-                cur.execute("SELECT dblink_disconnect('vmerge')")
-            master_conn.commit()
-        except Exception:
-            pass
         master_conn.close()
+        version_conn.close()
         raise
 
 
