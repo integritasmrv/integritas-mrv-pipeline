@@ -2,13 +2,12 @@
 """
 Production Pipeline for Company Register Data
 =============================================
-Fast COPY-based merge using INSERT ON CONFLICT DO UPDATE (upsert).
-Strategy: Stream from version DB -> staging table via StringIO pipe -> upsert into master
-
-Version DB schemas match CSV headers exactly (all TEXT for flexibility).
-Master DB schemas match production (created by 01_create_master_db.sql).
-Merge maps version columns to master columns case-insensitively.
-Source data may contain duplicate PKs - handled via DISTINCT ON.
+Merge strategy: stream version DB -> staging -> INSERT ON CONFLICT DO UPDATE (upsert).
+Per-table SAVEPOINT with continue-on-failure.
+NULLIF(col,'') on all type casts to handle empty strings in source data.
+LTRIM(col,'0') on typeofdenomination to strip leading zeros.
+DISTINCT ON (pk) to handle duplicate PKs in source data.
+Resume-from-table support via last_merged_table in pipeline_state.
 """
 import sys
 import os
@@ -26,6 +25,9 @@ DB_PORT = int(os.getenv('DB_PORT', '5434'))
 DB_USER = os.getenv('DB_USER', 'aiuser')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'aipassword123')
 MASTER_DB = 'BE KBO MASTER'
+
+MERGE_ORDER = ['enterprise', 'establishment', 'denomination',
+               'address', 'contact', 'activity', 'branch', 'code']
 
 TABLES = [
     ("Enterprise.csv", "kbo_master.enterprise", "kbo.enterprise"),
@@ -48,6 +50,22 @@ PK_COLS = {
     'branch': ['id'],
     'code': ['category', 'code', 'language'],
 }
+
+LEADING_ZERO_COLS = {'typeofdenomination'}
+
+CAST_MAP = {
+    'int2': 'smallint', 'int4': 'integer', 'int8': 'bigint',
+    'date': 'date', 'timestamp': 'timestamp',
+    'bool': 'boolean', 'float4': 'real', 'float8': 'double precision',
+    'numeric': 'numeric',
+}
+
+
+def cast_col(alias, col, pg_type, leading_zeros=False):
+    if not pg_type:
+        return f'{alias}."{col}"'
+    inner = f"LTRIM({alias}.\"{col}\", '0')" if leading_zeros else f'{alias}."{col}"'
+    return f"NULLIF({inner}, '')::{pg_type}"
 
 
 def get_conn(db):
@@ -117,7 +135,8 @@ def init_master():
             status VARCHAR(20) DEFAULT 'pending', load_started_at TIMESTAMP,
             load_completed_at TIMESTAMP, merge_started_at TIMESTAMP,
             merge_completed_at TIMESTAMP, records_loaded BIGINT, records_merged BIGINT,
-            error_message TEXT, created_at TIMESTAMP DEFAULT NOW())""")
+            error_message TEXT, last_merged_table VARCHAR(50),
+            created_at TIMESTAMP DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS public.pipeline_metrics (
             id SERIAL PRIMARY KEY, extract_version VARCHAR(50) NOT NULL,
             table_name VARCHAR(50) NOT NULL, operation VARCHAR(20) NOT NULL,
@@ -238,9 +257,107 @@ def load_extract(extract_path, label):
         raise
 
 
+def get_resume_tables(cur, label):
+    cur.execute("SELECT last_merged_table FROM public.pipeline_state WHERE extract_version = %s", (label,))
+    row = cur.fetchone()
+    if row and row[0] and row[0] in MERGE_ORDER:
+        idx = MERGE_ORDER.index(row[0]) + 1
+        logger.info(f"Resuming after {row[0]}: starting from {MERGE_ORDER[idx]}")
+        return MERGE_ORDER[idx:]
+    return MERGE_ORDER
+
+
+def merge_table(master_conn, version_conn, label, table_name, master_table, version_table, pkeys, master_types, mapped_master):
+    source_count = 0
+    with version_conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {version_table}")
+        source_count = cur.fetchone()[0]
+    with master_conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {master_table}")
+        master_before = cur.fetchone()[0]
+    logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
+
+    staging_table = f'public.kbo_merge_staging_{table_name}'
+    with master_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        col_defs = [f'"{c}" TEXT' for c in mapped_master]
+        cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
+    master_conn.commit()
+    logger.info(f"  Created staging {staging_table}")
+
+    staging_count = 0
+    src_cols_quoted = [f'"{c}"' for c in mapped_master]
+    with version_conn.cursor(f'stream_{table_name}') as vcur:
+        vcur.execute(f"SELECT {', '.join(src_cols_quoted)} FROM {version_table}")
+        while True:
+            rows = vcur.fetchmany(100000)
+            if not rows:
+                break
+            buf = io.StringIO()
+            csv.writer(buf, quoting=csv.QUOTE_ALL).writerows(rows)
+            buf.seek(0)
+            with master_conn.cursor() as mcur:
+                mcur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV)", buf)
+            master_conn.commit()
+            staging_count += len(rows)
+            logger.info(f"  Staging: {staging_count:,}/{source_count:,}")
+    logger.info(f"  Staged: {staging_count:,}")
+
+    pk_list = ', '.join([f'"{pk}"' for pk in pkeys])
+    pk_distinct = ', '.join([f's."{pk}"' for pk in pkeys])
+
+    select_parts = []
+    for c in mapped_master:
+        udt = master_types.get(c, 'text')
+        pg_type = CAST_MAP.get(udt)
+        lz = c in LEADING_ZERO_COLS
+        select_parts.append(cast_col('d', c, pg_type, leading_zeros=lz))
+    select_list = ', '.join(select_parts)
+    col_list = ', '.join([f'"{c}"' for c in mapped_master])
+
+    non_pk_cols = [c for c in mapped_master if c not in pkeys]
+    update_parts = [f'"{c}" = EXCLUDED."{c}"' for c in non_pk_cols]
+    update_clause = ', '.join(update_parts)
+
+    logger.info(f"  Upserting (DISTINCT ON {pk_list})...")
+
+    with master_conn.cursor() as cur:
+        if update_clause:
+            cur.execute(f"""INSERT INTO {master_table} ({col_list})
+                SELECT {select_list} FROM (
+                    SELECT DISTINCT ON ({pk_distinct}) *
+                    FROM {staging_table} s
+                ) d
+                ON CONFLICT ({pk_list}) DO UPDATE SET {update_clause}""")
+        else:
+            cur.execute(f"""INSERT INTO {master_table} ({col_list})
+                SELECT {select_list} FROM (
+                    SELECT DISTINCT ON ({pk_distinct}) *
+                    FROM {staging_table} s
+                ) d
+                ON CONFLICT ({pk_list}) DO NOTHING""")
+        upserted = cur.rowcount
+    master_conn.commit()
+    logger.info(f"  Upserted: {upserted:,}")
+
+    with master_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+    master_conn.commit()
+
+    with master_conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {master_table}")
+        master_after = cur.fetchone()[0]
+    with master_conn.cursor() as cur:
+        cur.execute("""INSERT INTO public.pipeline_metrics
+            (extract_version, table_name, operation, rows_count)
+            VALUES (%s, %s, 'MERGED', %s)""", (label, table_name, source_count))
+    master_conn.commit()
+    logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,})")
+    return source_count
+
+
 def merge_extract(label):
-    """Upsert merge: stream version DB -> staging -> INSERT ON CONFLICT DO UPDATE
-    Uses DISTINCT ON (pk) to deduplicate source data before upsert."""
+    """Per-table upsert with SAVEPOINT and continue-on-failure."""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
@@ -258,21 +375,22 @@ def merge_extract(label):
     with master_conn.cursor() as cur:
         cur.execute("UPDATE public.pipeline_state SET status = 'merging', merge_started_at = NOW() WHERE extract_version = %s", (label,))
         master_conn.commit()
+
+    tables_to_merge = get_resume_tables(master_conn.cursor(), label)
     total_ops = 0
+    failed_tables = []
 
-    cast_map = {
-        'int2': '::smallint', 'int4': '::integer', 'int8': '::bigint',
-        'varchar': '', 'text': '', 'bpchar': '',
-        'date': '::date', 'timestamp': '::timestamp',
-        'bool': '::boolean', 'float4': '::real', 'float8': '::double precision',
-        'numeric': '::numeric',
-    }
+    for csv_file, master_table, version_table in TABLES:
+        table_name = master_table.split('.')[1]
+        if table_name not in tables_to_merge:
+            continue
 
-    try:
-        for csv_file, master_table, version_table in TABLES:
-            table_name = master_table.split('.')[1]
-            pkeys = PK_COLS.get(table_name, [])
-            logger.info(f"Merging {master_table}...")
+        pkeys = PK_COLS.get(table_name, [])
+        logger.info(f"Merging {master_table}...")
+
+        try:
+            with master_conn.cursor() as cur:
+                cur.execute(f"SAVEPOINT sp_{table_name};")
 
             with version_conn.cursor() as cur:
                 schema, tbl = version_table.split('.')
@@ -285,6 +403,7 @@ def merge_extract(label):
                 master_info = cur.fetchall()
                 master_cols = [r[0] for r in master_info]
                 master_types = {r[0]: r[1] for r in master_info}
+
             master_cols_lower = {c.lower(): c for c in master_cols}
             src_to_master = {}
             for sc in src_cols:
@@ -294,128 +413,52 @@ def merge_extract(label):
             mapped_master = [src_to_master[c] for c in mapped_src]
             logger.info(f"  Mapped {len(mapped_src)}/{len(src_cols)} cols: {mapped_master}")
 
-            with version_conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {version_table}")
-                source_count = cur.fetchone()[0]
-            with master_conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {master_table}")
-                master_before = cur.fetchone()[0]
-            logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
+            ops = merge_table(master_conn, version_conn, label, table_name,
+                              master_table, version_table, pkeys, master_types, mapped_master)
+            total_ops += ops
 
-            staging_table = f'public.kbo_merge_staging_{table_name}'
             with master_conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
-                col_defs = [f'"{c}" TEXT' for c in mapped_master]
-                cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
+                cur.execute(f"RELEASE SAVEPOINT sp_{table_name};")
+            with master_conn.cursor() as cur:
+                cur.execute("UPDATE public.pipeline_state SET last_merged_table = %s WHERE extract_version = %s",
+                            (table_name, label))
             master_conn.commit()
-            logger.info(f"  Created staging {staging_table}")
+            logger.info(f"  {table_name}: OK")
 
-            staging_count = 0
-            src_cols_quoted = [f'"{c}"' for c in mapped_src]
-            with version_conn.cursor(f'stream_{table_name}') as vcur:
-                vcur.execute(f"SELECT {', '.join(src_cols_quoted)} FROM {version_table}")
-                while True:
-                    rows = vcur.fetchmany(100000)
-                    if not rows:
-                        break
-                    buf = io.StringIO()
-                    csv.writer(buf, quoting=csv.QUOTE_ALL).writerows(rows)
-                    buf.seek(0)
-                    with master_conn.cursor() as mcur:
-                        mcur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV)", buf)
-                    master_conn.commit()
-                    staging_count += len(rows)
-                    logger.info(f"  Staging: {staging_count:,}/{source_count:,}")
-            logger.info(f"  Staged: {staging_count:,}")
+        except Exception as e:
+            logger.error(f"  {table_name}: FAILED — {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                with master_conn.cursor() as cur:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT sp_{table_name};")
+                master_conn.commit()
+            except Exception:
+                pass
+            failed_tables.append(table_name)
+            logger.info(f"  Continuing to next table...")
 
-            with master_conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
-                actual_staged = cur.fetchone()[0]
-            if actual_staged != staging_count:
-                logger.warning(f"  Staging recount: {actual_staged:,} (reported {staging_count:,})")
-
-            pk_list = ', '.join([f'"{pk}"' for pk in pkeys])
-            pk_distinct = ', '.join([f's."{pk}"' for pk in pkeys])
-            select_parts = []
-            for c in mapped_master:
-                udt = master_types.get(c, 'text')
-                suffix = cast_map.get(udt, '')
-                if suffix:
-                    select_parts.append(f'd."{c}"{suffix}')
-                else:
-                    select_parts.append(f'd."{c}"')
-            select_list = ', '.join(select_parts)
-            col_list = ', '.join([f'"{c}"' for c in mapped_master])
-
-            non_pk_cols = [c for c in mapped_master if c not in pkeys]
-            update_parts = [f'"{c}" = EXCLUDED."{c}"' for c in non_pk_cols]
-            update_clause = ', '.join(update_parts)
-
-            logger.info(f"  Upserting (DISTINCT ON {pk_list})...")
-
-            with master_conn.cursor() as cur:
-                if update_clause:
-                    cur.execute(f"""INSERT INTO {master_table} ({col_list})
-                        SELECT {select_list} FROM (
-                            SELECT DISTINCT ON ({pk_distinct}) *
-                            FROM {staging_table} s
-                        ) d
-                        ON CONFLICT ({pk_list}) DO UPDATE SET {update_clause}""")
-                else:
-                    cur.execute(f"""INSERT INTO {master_table} ({col_list})
-                        SELECT {select_list} FROM (
-                            SELECT DISTINCT ON ({pk_distinct}) *
-                            FROM {staging_table} s
-                        ) d
-                        ON CONFLICT ({pk_list}) DO NOTHING""")
-                upserted = cur.rowcount
-            master_conn.commit()
-            logger.info(f"  Upserted: {upserted:,}")
-
-            with master_conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
-            master_conn.commit()
-
-            with master_conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {master_table}")
-                master_after = cur.fetchone()[0]
-            with master_conn.cursor() as cur:
-                cur.execute("""INSERT INTO public.pipeline_metrics
-                    (extract_version, table_name, operation, rows_count)
-                    VALUES (%s, %s, 'MERGED', %s)""", (label, table_name, source_count))
-            master_conn.commit()
-            logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,})")
-            total_ops += source_count
-
+    if not failed_tables:
         with master_conn.cursor() as cur:
             cur.execute("""UPDATE public.pipeline_state
                 SET status = 'merged', merge_completed_at = NOW(), records_merged = %s
                 WHERE extract_version = %s""", (total_ops, label))
             master_conn.commit()
         logger.info(f"Merge complete: {total_ops:,} total")
+    else:
         with master_conn.cursor() as cur:
-            cur.execute("SET session_replication_role = 'origin';")
-        master_conn.commit()
-        master_conn.close()
-        version_conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"Merge failed: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            master_conn.rollback()
-        except Exception:
-            pass
-        with master_conn.cursor() as cur:
-            cur.execute("SET session_replication_role = 'origin';")
-        master_conn.commit()
-        with master_conn.cursor() as cur:
-            cur.execute("UPDATE public.pipeline_state SET status = 'failed', error_message = %s WHERE extract_version = %s", (str(e)[:500], label))
+            cur.execute("""UPDATE public.pipeline_state
+                SET status = 'partial', error_message = %s
+                WHERE extract_version = %s""",
+                (f"Failed tables: {', '.join(failed_tables)}", label))
             master_conn.commit()
-        master_conn.close()
-        version_conn.close()
-        raise
+        logger.warning(f"Merge partial: {len(failed_tables)} tables failed: {failed_tables}")
+
+    with master_conn.cursor() as cur:
+        cur.execute("SET session_replication_role = 'origin';")
+    master_conn.commit()
+    master_conn.close()
+    version_conn.close()
 
 
 def show_status():
@@ -424,7 +467,8 @@ def show_status():
     print("PIPELINE STATUS")
     print("="*70)
     with conn.cursor() as cur:
-        cur.execute("""SELECT extract_version, status, records_loaded, records_merged, error_message
+        cur.execute("""SELECT extract_version, status, records_loaded, records_merged,
+            error_message, last_merged_table
             FROM public.pipeline_state ORDER BY extract_version""")
         for row in cur.fetchall():
             print(f"\nVersion {row[0]}: {row[1]}")
@@ -432,6 +476,8 @@ def show_status():
             print(f"  Merged: {row[3] or 0:,} records")
             if row[4]:
                 print(f"  Error: {row[4]}")
+            if row[5]:
+                print(f"  Last merged table: {row[5]}")
     print("\n" + "-"*70)
     print("METRICS")
     print("-"*70)
