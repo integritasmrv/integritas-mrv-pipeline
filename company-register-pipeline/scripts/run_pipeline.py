@@ -268,10 +268,13 @@ def merge_extract(label):
                 cur.execute("""SELECT column_name FROM information_schema.columns
                     WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
                 src_cols = [r[0] for r in cur.fetchall()]
+            # Get master columns and types
             with master_conn.cursor() as cur:
-                cur.execute("""SELECT column_name FROM information_schema.columns
+                cur.execute("""SELECT column_name, udt_name FROM information_schema.columns
                     WHERE table_schema = 'kbo_master' AND table_name = %s ORDER BY ordinal_position""", (table_name,))
-                master_cols = [r[0] for r in cur.fetchall()]
+                master_info = cur.fetchall()
+                master_cols = [r[0] for r in master_info]
+                master_types = {r[0]: r[1] for r in master_info}
             master_cols_lower = {c.lower(): c for c in master_cols}
             src_to_master = {}
             for sc in src_cols:
@@ -316,9 +319,10 @@ def merge_extract(label):
                 cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
                 staging_count = cur.fetchone()[0]
             logger.info(f"  Staged: {staging_count:,}")
+            # DELETE matching rows - cast master cols to text since staging is all TEXT
             deleted = 0
             if pkeys:
-                where_parts = [f'm."{pk}" = s."{pk}"' for pk in pkeys]
+                where_parts = [f'm."{pk}"::text = s."{pk}"' for pk in pkeys]
                 where_clause = ' AND '.join(where_parts)
                 with master_conn.cursor() as cur:
                     cur.execute(f"""DELETE FROM {master_table} m
@@ -326,9 +330,26 @@ def merge_extract(label):
                     deleted = cur.rowcount
                 master_conn.commit()
                 logger.info(f"  Deleted: {deleted:,}")
+            # INSERT from staging with type casts
+            cast_map = {
+                'int2': '::smallint', 'int4': '::integer', 'int8': '::bigint',
+                'varchar': '', 'text': '', 'bpchar': '',
+                'date': '::date', 'timestamp': '::timestamp',
+                'bool': '::boolean', 'float4': '::real', 'float8': '::double precision',
+                'numeric': '::numeric',
+            }
+            select_parts = []
+            for c in mapped_master:
+                udt = master_types.get(c, 'text')
+                suffix = cast_map.get(udt, '')
+                if suffix:
+                    select_parts.append(f's."{c}"{suffix}')
+                else:
+                    select_parts.append(f's."{c}"')
+            select_list = ', '.join(select_parts)
             col_list = ', '.join([f'"{c}"' for c in mapped_master])
             with master_conn.cursor() as cur:
-                cur.execute(f"INSERT INTO {master_table} ({col_list}) SELECT {col_list} FROM {staging_table}")
+                cur.execute(f"INSERT INTO {master_table} ({col_list}) SELECT {select_list} FROM {staging_table} s")
                 inserted = cur.rowcount
             master_conn.commit()
             logger.info(f"  Inserted: {inserted:,}")
@@ -362,11 +383,13 @@ def merge_extract(label):
         logger.error(f"Merge failed: {e}")
         import traceback
         traceback.print_exc()
+        try:
+            master_conn.rollback()
+        except Exception:
+            pass
         with master_conn.cursor() as cur:
             cur.execute("SET session_replication_role = 'origin';")
         master_conn.commit()
-        with master_conn.cursor() as cur:
-            cur.execute("ROLLBACK")
         with master_conn.cursor() as cur:
             cur.execute("UPDATE public.pipeline_state SET status = 'failed', error_message = %s WHERE extract_version = %s", (str(e)[:500], label))
             master_conn.commit()
