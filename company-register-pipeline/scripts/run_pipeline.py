@@ -242,6 +242,12 @@ def merge_extract(label):
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
+
+    # Disable FK constraints and triggers during merge
+    with master_conn.cursor() as cur:
+        cur.execute("SET session_replication_role = 'replica';")
+    master_conn.commit()
+
     with master_conn.cursor() as cur:
         cur.execute("SELECT status FROM public.pipeline_state WHERE extract_version = %s", (label,))
         row = cur.fetchone()
@@ -345,6 +351,10 @@ def merge_extract(label):
                 WHERE extract_version = %s""", (total_ops, label))
             master_conn.commit()
         logger.info(f"Merge complete: {total_ops:,} total")
+        # Re-enable FK constraints and triggers
+        with master_conn.cursor() as cur:
+            cur.execute("SET session_replication_role = 'origin';")
+        master_conn.commit()
         master_conn.close()
         version_conn.close()
         return True
@@ -352,6 +362,9 @@ def merge_extract(label):
         logger.error(f"Merge failed: {e}")
         import traceback
         traceback.print_exc()
+        with master_conn.cursor() as cur:
+            cur.execute("SET session_replication_role = 'origin';")
+        master_conn.commit()
         with master_conn.cursor() as cur:
             cur.execute("ROLLBACK")
         with master_conn.cursor() as cur:
