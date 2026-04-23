@@ -2,8 +2,8 @@
 """
 Production Pipeline for Company Register Data
 =============================================
-Fast COPY-based merge with atomic DELETE+INSERT.
-Strategy: Stream from version DB -> staging table via StringIO pipe -> atomic DELETE+INSERT
+Fast COPY-based merge using INSERT ON CONFLICT DO UPDATE (upsert).
+Strategy: Stream from version DB -> staging table via StringIO pipe -> upsert into master
 
 Version DB schemas match CSV headers exactly (all TEXT for flexibility).
 Master DB schemas match production (created by 01_create_master_db.sql).
@@ -238,7 +238,7 @@ def load_extract(extract_path, label):
 
 
 def merge_extract(label):
-    """Fast merge using in-memory StringIO pipe: stream from version DB -> staging -> atomic DELETE+INSERT"""
+    """Upsert merge: stream version DB -> staging -> INSERT ON CONFLICT DO UPDATE"""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
@@ -331,27 +331,7 @@ def merge_extract(label):
                     f"Staging count mismatch for {table_name}: "
                     f"staged={staging_count:,} vs source={source_count:,}")
 
-            with master_conn.cursor() as cur:
-                cur.execute("SAVEPOINT merge_atomic;")
-
-            deleted = 0
-            if pkeys:
-                where_parts = []
-                for pk in pkeys:
-                    udt = master_types.get(pk, 'text')
-                    cast = cast_map.get(udt, '')
-                    if cast:
-                        where_parts.append(f'm."{pk}" = s."{pk}"{cast}')
-                    else:
-                        where_parts.append(f'm."{pk}"::text = s."{pk}"')
-                where_clause = ' AND '.join(where_parts)
-                logger.info(f"  DELETE WHERE: {where_clause}")
-                with master_conn.cursor() as cur:
-                    cur.execute(f"""DELETE FROM {master_table} m
-                        WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {where_clause})""")
-                    deleted = cur.rowcount
-                logger.info(f"  Deleted: {deleted:,}")
-
+            pk_list = ', '.join([f'"{pk}"' for pk in pkeys])
             select_parts = []
             for c in mapped_master:
                 udt = master_types.get(c, 'text')
@@ -362,13 +342,25 @@ def merge_extract(label):
                     select_parts.append(f's."{c}"')
             select_list = ', '.join(select_parts)
             col_list = ', '.join([f'"{c}"' for c in mapped_master])
-            with master_conn.cursor() as cur:
-                cur.execute(f"INSERT INTO {master_table} ({col_list}) SELECT {select_list} FROM {staging_table} s")
-                inserted = cur.rowcount
-            logger.info(f"  Inserted: {inserted:,}")
 
+            non_pk_cols = [c for c in mapped_master if c not in pkeys]
+            update_parts = [f'"{c}" = EXCLUDED."{c}"' for c in non_pk_cols]
+            update_clause = ', '.join(update_parts)
+
+            logger.info(f"  Upserting {staging_count:,} rows (ON CONFLICT {pk_list})...")
+
+            with master_conn.cursor() as cur:
+                if update_clause:
+                    cur.execute(f"""INSERT INTO {master_table} ({col_list})
+                        SELECT {select_list} FROM {staging_table} s
+                        ON CONFLICT ({pk_list}) DO UPDATE SET {update_clause}""")
+                else:
+                    cur.execute(f"""INSERT INTO {master_table} ({col_list})
+                        SELECT {select_list} FROM {staging_table} s
+                        ON CONFLICT ({pk_list}) DO NOTHING""")
+                upserted = cur.rowcount
             master_conn.commit()
-            logger.info(f"  DELETE+INSERT committed atomically")
+            logger.info(f"  Upserted: {upserted:,}")
 
             with master_conn.cursor() as cur:
                 cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
@@ -382,7 +374,7 @@ def merge_extract(label):
                     (extract_version, table_name, operation, rows_count)
                     VALUES (%s, %s, 'MERGED', %s)""", (label, table_name, source_count))
             master_conn.commit()
-            logger.info(f"  {master_table}: {source_count:,} merged ({deleted:,} replaced, {inserted:,} new) -> {master_after:,}")
+            logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,})")
             total_ops += source_count
 
         with master_conn.cursor() as cur:
