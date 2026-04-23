@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Production Pipeline for Company Register Data
-=============================================
-Simple, fast COPY-based merge.
-Strategy: COPY to staging -> DELETE matching -> INSERT FROM staging
-
-FIXES APPLIED:
-- Proper quoting of uppercase column names in COPY SELECT
-- Case-insensitive column mapping between source (uppercase) and master (lowercase)
-- Correct PK matching for DELETE/INSERT
-- Using csv.writer for proper CSV export instead of manual string building
-"""
 import sys
 import os
 import logging
@@ -68,7 +55,6 @@ def init_master():
     conn = get_conn(MASTER_DB)
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS kbo_master")
-        
         cur.execute("""CREATE TABLE IF NOT EXISTS kbo_master.enterprise (
             enterprisenumber VARCHAR(20) PRIMARY KEY, status VARCHAR(2),
             juridicalsituation VARCHAR(10), typeofenterprise VARCHAR(3),
@@ -93,7 +79,6 @@ def init_master():
             id SERIAL PRIMARY KEY, enterprisenumber VARCHAR(20), establishmentnumber VARCHAR(20), startdate VARCHAR(20))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS kbo_master.code (
             entitynumber VARCHAR(20) PRIMARY KEY, type VARCHAR(50), code VARCHAR(50))""")
-
         cur.execute("""CREATE TABLE IF NOT EXISTS public.pipeline_state (
             id SERIAL PRIMARY KEY, extract_version VARCHAR(50) UNIQUE NOT NULL,
             status VARCHAR(20) DEFAULT 'pending', load_started_at TIMESTAMP,
@@ -165,7 +150,7 @@ def create_version_db(label):
 def load_csv(conn, csv_path, table):
     with open(csv_path, 'r', encoding='latin-1', errors='replace') as f:
         with conn.cursor() as cur:
-            cur.copy_expert(f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER, DELIMITER E'\\t', NULL '')", f)
+            cur.copy_expert(f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER, DELIMITER ',', NULL '')", f)
     conn.commit()
 
 
