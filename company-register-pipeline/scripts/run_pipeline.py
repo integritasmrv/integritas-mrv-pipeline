@@ -147,7 +147,6 @@ def create_version_db(label):
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS kbo")
         for sql in [
-            # Columns match CSV headers exactly, all TEXT for flexibility
             """CREATE TABLE kbo.enterprise (
                 EnterpriseNumber TEXT PRIMARY KEY, Status TEXT,
                 JuridicalSituation TEXT, TypeOfEnterprise TEXT,
@@ -238,12 +237,11 @@ def load_extract(extract_path, label):
 
 
 def merge_extract(label):
-    """Fast merge: COPY source -> staging -> DELETE+INSERT"""
+    """Fast merge: COPY source -> staging -> DELETE+INSERT (atomic per table via SAVEPOINT)"""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
 
-    # Disable FK constraints and triggers during merge
     with master_conn.cursor() as cur:
         cur.execute("SET session_replication_role = 'replica';")
     master_conn.commit()
@@ -268,7 +266,6 @@ def merge_extract(label):
                 cur.execute("""SELECT column_name FROM information_schema.columns
                     WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""", (schema, tbl))
                 src_cols = [r[0] for r in cur.fetchall()]
-            # Get master columns and types
             with master_conn.cursor() as cur:
                 cur.execute("""SELECT column_name, udt_name FROM information_schema.columns
                     WHERE table_schema = 'kbo_master' AND table_name = %s ORDER BY ordinal_position""", (table_name,))
@@ -290,6 +287,7 @@ def merge_extract(label):
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_before = cur.fetchone()[0]
             logger.info(f"  Source: {source_count:,}, Master before: {master_before:,}")
+
             temp_file = f'/tmp/{table_name}_merge.csv'
             with version_conn.cursor() as cur:
                 cols_quoted = ['"' + c + '"' for c in mapped_src]
@@ -303,23 +301,39 @@ def merge_extract(label):
                             break
                         writer.writerows(rows)
             logger.info(f"  Exported to {temp_file}")
-            staging_table = f'kbo_merge_staging_{table_name}'
+
+            staging_table = f'public.kbo_merge_staging_{table_name}'
             with master_conn.cursor() as cur:
                 cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
                 col_defs = [f'"{c}" TEXT' for c in mapped_master]
                 cur.execute(f"CREATE TABLE {staging_table} ({', '.join(col_defs)})")
             master_conn.commit()
+            logger.info(f"  Created staging table {staging_table}")
+
             with open(temp_file, 'r', encoding='utf-8', errors='replace') as f:
                 with master_conn.cursor() as cur:
                     next(f)
-                    cur.copy_expert(f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV, DELIMITER ',', NULL '')", f)
+                    cur.copy_expert(
+                        f"COPY {staging_table} FROM STDIN WITH (FORMAT CSV, DELIMITER ',', NULL '')",
+                        f)
             master_conn.commit()
+            logger.info(f"  Loaded staging table")
+
             os.remove(temp_file)
+
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {staging_table}")
                 staging_count = cur.fetchone()[0]
             logger.info(f"  Staged: {staging_count:,}")
-            # DELETE matching rows - cast master cols to text since staging is all TEXT
+
+            if staging_count != source_count:
+                raise RuntimeError(
+                    f"Staging count mismatch for {table_name}: "
+                    f"staged={staging_count:,} vs source={source_count:,}")
+
+            with master_conn.cursor() as cur:
+                cur.execute("SAVEPOINT merge_delete_insert;")
+
             deleted = 0
             if pkeys:
                 where_parts = [f'm."{pk}"::text = s."{pk}"' for pk in pkeys]
@@ -328,9 +342,8 @@ def merge_extract(label):
                     cur.execute(f"""DELETE FROM {master_table} m
                         WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {where_clause})""")
                     deleted = cur.rowcount
-                master_conn.commit()
                 logger.info(f"  Deleted: {deleted:,}")
-            # INSERT from staging with type casts
+
             cast_map = {
                 'int2': '::smallint', 'int4': '::integer', 'int8': '::bigint',
                 'varchar': '', 'text': '', 'bpchar': '',
@@ -351,11 +364,15 @@ def merge_extract(label):
             with master_conn.cursor() as cur:
                 cur.execute(f"INSERT INTO {master_table} ({col_list}) SELECT {select_list} FROM {staging_table} s")
                 inserted = cur.rowcount
-            master_conn.commit()
             logger.info(f"  Inserted: {inserted:,}")
-            with master_conn.cursor() as cur:
-                cur.execute(f"DROP TABLE {staging_table}")
+
             master_conn.commit()
+            logger.info(f"  DELETE+INSERT committed atomically")
+
+            with master_conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+            master_conn.commit()
+
             with master_conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {master_table}")
                 master_after = cur.fetchone()[0]
@@ -372,7 +389,6 @@ def merge_extract(label):
                 WHERE extract_version = %s""", (total_ops, label))
             master_conn.commit()
         logger.info(f"Merge complete: {total_ops:,} total")
-        # Re-enable FK constraints and triggers
         with master_conn.cursor() as cur:
             cur.execute("SET session_replication_role = 'origin';")
         master_conn.commit()
