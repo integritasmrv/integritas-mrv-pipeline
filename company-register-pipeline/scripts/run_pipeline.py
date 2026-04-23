@@ -257,6 +257,15 @@ def merge_extract(label):
         cur.execute("UPDATE public.pipeline_state SET status = 'merging', merge_started_at = NOW() WHERE extract_version = %s", (label,))
         master_conn.commit()
     total_ops = 0
+
+    cast_map = {
+        'int2': '::smallint', 'int4': '::integer', 'int8': '::bigint',
+        'varchar': '', 'text': '', 'bpchar': '',
+        'date': '::date', 'timestamp': '::timestamp',
+        'bool': '::boolean', 'float4': '::real', 'float8': '::double precision',
+        'numeric': '::numeric',
+    }
+
     try:
         for csv_file, master_table, version_table in TABLES:
             table_name = master_table.split('.')[1]
@@ -327,21 +336,22 @@ def merge_extract(label):
 
             deleted = 0
             if pkeys:
-                where_parts = [f'm."{pk}"::text = s."{pk}"' for pk in pkeys]
+                where_parts = []
+                for pk in pkeys:
+                    udt = master_types.get(pk, 'text')
+                    cast = cast_map.get(udt, '')
+                    if cast:
+                        where_parts.append(f'm."{pk}" = s."{pk}"{cast}')
+                    else:
+                        where_parts.append(f'm."{pk}"::text = s."{pk}"')
                 where_clause = ' AND '.join(where_parts)
+                logger.info(f"  DELETE WHERE: {where_clause}")
                 with master_conn.cursor() as cur:
                     cur.execute(f"""DELETE FROM {master_table} m
                         WHERE EXISTS (SELECT 1 FROM {staging_table} s WHERE {where_clause})""")
                     deleted = cur.rowcount
                 logger.info(f"  Deleted: {deleted:,}")
 
-            cast_map = {
-                'int2': '::smallint', 'int4': '::integer', 'int8': '::bigint',
-                'varchar': '', 'text': '', 'bpchar': '',
-                'date': '::date', 'timestamp': '::timestamp',
-                'bool': '::boolean', 'float4': '::real', 'float8': '::double precision',
-                'numeric': '::numeric',
-            }
             select_parts = []
             for c in mapped_master:
                 udt = master_types.get(c, 'text')
