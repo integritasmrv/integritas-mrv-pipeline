@@ -5,8 +5,13 @@ Production Pipeline for Company Register Data
 Phase 1 (initial load): stream version DB -> staging -> INSERT ON CONFLICT DO UPDATE
 Phase 2 (incremental):  reladiff to identify changed rows only, then apply delta
 
+Architecture:
+- Central `pipeline` database tracks all datasources (BE KBO, UK CH, etc.)
+- Each master DB is pure data (no pipeline overhead)
+- Metabase connects to pipeline DB for dashboards
+
 Fixes applied:
-- NULLIF(col,'') on all type casts (empty strings → NULL)
+- NULLIF(col,'') on all type casts (empty strings -> NULL)
 - LTRIM(col,'0') on typeofdenomination (leading zeros)
 - to_date(col, 'DD-MM-YYYY') for KBO date format
 - Per-table SAVEPOINT (after staging, before upsert) with continue-on-failure
@@ -18,6 +23,8 @@ import os
 import logging
 import csv
 import io
+import time
+import json
 from datetime import datetime
 import psycopg2
 
@@ -28,7 +35,8 @@ DB_HOST = os.getenv('DB_HOST', '127.0.0.1')
 DB_PORT = int(os.getenv('DB_PORT', '5434'))
 DB_USER = os.getenv('DB_USER', 'aiuser')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'aipassword123')
-MASTER_DB = 'BE KBO MASTER'
+PIPELINE_DB = 'pipeline'
+DATASOURCE_CODE = os.getenv('DATASOURCE_CODE', 'BE_KBO')
 
 MERGE_ORDER = ['enterprise', 'establishment', 'denomination',
                'address', 'contact', 'activity', 'branch', 'code']
@@ -79,8 +87,115 @@ def get_conn(db):
     return psycopg2.connect(host=DB_HOST, port=DB_PORT, database=db, user=DB_USER, password=DB_PASSWORD)
 
 
+def get_pipeline_conn():
+    return get_conn(PIPELINE_DB)
+
+
+def get_master_db():
+    conn = get_pipeline_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT master_db FROM datasource_registry WHERE code = %s", (DATASOURCE_CODE,))
+        row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise ValueError(f"Datasource {DATASOURCE_CODE} not registered in pipeline.datasource_registry")
+    return row[0]
+
+
+MASTER_DB = None
+
+
+def init_pipeline_db():
+    conn = get_conn("postgres")
+    conn.set_isolation_level(0)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{PIPELINE_DB}"')
+    except psycopg2.errors.DuplicateDatabase:
+        pass
+    conn.close()
+
+    conn = get_pipeline_conn()
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS datasource_registry (
+            id SERIAL PRIMARY KEY,
+            code VARCHAR(20) UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            country VARCHAR(5),
+            master_db VARCHAR(100) NOT NULL,
+            version_db_pattern TEXT NOT NULL,
+            db_host VARCHAR(100) DEFAULT '127.0.0.1',
+            db_port INT DEFAULT 5434,
+            db_user VARCHAR(50) DEFAULT 'aiuser',
+            db_password VARCHAR(100) DEFAULT 'aipassword123',
+            csv_base_path TEXT,
+            merge_order TEXT[] DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id SERIAL PRIMARY KEY,
+            datasource_code VARCHAR(20) REFERENCES datasource_registry(code),
+            extract_version VARCHAR(50) NOT NULL,
+            status VARCHAR(20) DEFAULT 'pending',
+            load_started_at TIMESTAMP,
+            load_completed_at TIMESTAMP,
+            merge_started_at TIMESTAMP,
+            merge_completed_at TIMESTAMP,
+            records_loaded BIGINT,
+            records_merged BIGINT,
+            error_message TEXT,
+            last_merged_table VARCHAR(50),
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(datasource_code, extract_version))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS table_metrics (
+            id SERIAL PRIMARY KEY,
+            datasource_code VARCHAR(20) NOT NULL,
+            extract_version VARCHAR(50) NOT NULL,
+            table_name VARCHAR(50) NOT NULL,
+            operation VARCHAR(20) NOT NULL,
+            rows_count BIGINT NOT NULL,
+            duration_sec FLOAT,
+            recorded_at TIMESTAMP DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS quality_checks (
+            id SERIAL PRIMARY KEY,
+            datasource_code VARCHAR(20) NOT NULL,
+            extract_version VARCHAR(50),
+            table_name VARCHAR(50) NOT NULL,
+            check_type VARCHAR(30) NOT NULL,
+            check_result JSONB,
+            status VARCHAR(10) NOT NULL,
+            checked_at TIMESTAMP DEFAULT NOW())""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_datasource ON pipeline_runs(datasource_code, extract_version)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_status ON pipeline_runs(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tm_datasource ON table_metrics(datasource_code, extract_version)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_qc_datasource ON quality_checks(datasource_code, check_type)")
+    conn.commit()
+    conn.close()
+    logger.info("Pipeline database initialized.")
+
+
+def register_datasource_if_needed():
+    conn = get_pipeline_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM datasource_registry WHERE code = %s", (DATASOURCE_CODE,))
+        if not cur.fetchone():
+            cur.execute("""INSERT INTO datasource_registry (code, name, country, master_db, version_db_pattern, csv_base_path, merge_order)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (DATASOURCE_CODE, 'Belgium KBO Company Register', 'BE', 'BE KBO MASTER',
+                 'BE KBO {version}', '/mnt/win_data/BE/KBO',
+                 ['enterprise', 'establishment', 'denomination', 'address', 'contact', 'activity', 'branch', 'code']))
+            conn.commit()
+            logger.info(f"Registered datasource: {DATASOURCE_CODE}")
+    conn.close()
+
+
 def init_master():
-    logger.info("Initializing master database...")
+    global MASTER_DB
+    init_pipeline_db()
+    register_datasource_if_needed()
+    MASTER_DB = get_master_db()
+
+    logger.info(f"Initializing master database: {MASTER_DB}...")
     conn = get_conn("postgres")
     conn.set_isolation_level(0)
     try:
@@ -137,26 +252,18 @@ def init_master():
             language VARCHAR(2) NOT NULL,
             description TEXT,
             PRIMARY KEY (category, code, language))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS public.pipeline_state (
-            id SERIAL PRIMARY KEY, extract_version VARCHAR(50) UNIQUE NOT NULL,
-            status VARCHAR(20) DEFAULT 'pending', load_started_at TIMESTAMP,
-            load_completed_at TIMESTAMP, merge_started_at TIMESTAMP,
-            merge_completed_at TIMESTAMP, records_loaded BIGINT, records_merged BIGINT,
-            error_message TEXT, last_merged_table VARCHAR(50),
-            created_at TIMESTAMP DEFAULT NOW())""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS public.pipeline_metrics (
-            id SERIAL PRIMARY KEY, extract_version VARCHAR(50) NOT NULL,
-            table_name VARCHAR(50) NOT NULL, operation VARCHAR(20) NOT NULL,
-            rows_count BIGINT NOT NULL, recorded_at TIMESTAMP DEFAULT NOW())""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_state_version ON public.pipeline_state(extract_version)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_metrics_version ON public.pipeline_metrics(extract_version, table_name)")
     conn.commit()
     conn.close()
     logger.info("Master database initialized.")
 
 
 def get_version_db(label):
-    return f"BE KBO {label}"
+    conn = get_pipeline_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT version_db_pattern FROM datasource_registry WHERE code = %s", (DATASOURCE_CODE,))
+        pattern = cur.fetchone()[0]
+    conn.close()
+    return pattern.replace('{version}', label)
 
 
 def create_version_db(label):
@@ -221,18 +328,21 @@ def load_csv(conn, csv_path, table):
 
 def load_extract(extract_path, label):
     dbname = get_version_db(label)
-    state_conn = get_conn(MASTER_DB)
-    with state_conn.cursor() as cur:
-        cur.execute("SELECT status FROM public.pipeline_state WHERE extract_version = %s", (label,))
+    pipeline_conn = get_pipeline_conn()
+    with pipeline_conn.cursor() as cur:
+        cur.execute("SELECT status FROM pipeline_runs WHERE datasource_code = %s AND extract_version = %s",
+                    (DATASOURCE_CODE, label))
         row = cur.fetchone()
         if row and row[0] in ('loaded', 'merging', 'merged'):
             logger.info(f"Version {label} already {row[0]}, skipping load")
+            pipeline_conn.close()
             return False
-    with state_conn.cursor() as cur:
-        cur.execute("""INSERT INTO public.pipeline_state (extract_version, status, load_started_at)
-            VALUES (%s, 'loading', NOW())
-            ON CONFLICT (extract_version) DO UPDATE SET status = 'loading', load_started_at = NOW()""", (label,))
-        state_conn.commit()
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""INSERT INTO pipeline_runs (datasource_code, extract_version, status, load_started_at)
+            VALUES (%s, %s, 'loading', NOW())
+            ON CONFLICT (datasource_code, extract_version) DO UPDATE SET status = 'loading', load_started_at = NOW(), updated_at = NOW()""",
+            (DATASOURCE_CODE, label))
+        pipeline_conn.commit()
     try:
         create_version_db(label)
         total = 0
@@ -243,29 +353,42 @@ def load_extract(extract_path, label):
                 continue
             logger.info(f"Loading {csv_file}...")
             conn = get_conn(dbname)
+            t0 = time.time()
             load_csv(conn, csv_path, version_table)
             with conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {version_table}")
                 cnt = cur.fetchone()[0]
             conn.close()
-            logger.info(f"  -> {cnt:,} rows")
+            elapsed = time.time() - t0
+            logger.info(f"  -> {cnt:,} rows ({elapsed:.1f}s)")
             total += cnt
-        with state_conn.cursor() as cur:
-            cur.execute("UPDATE public.pipeline_state SET status = 'loaded', load_completed_at = NOW(), records_loaded = %s WHERE extract_version = %s", (total, label))
-            state_conn.commit()
-        state_conn.close()
+            with pipeline_conn.cursor() as cur:
+                cur.execute("""INSERT INTO table_metrics (datasource_code, extract_version, table_name, operation, rows_count, duration_sec)
+                    VALUES (%s, %s, %s, 'LOADED', %s, %s)""",
+                    (DATASOURCE_CODE, label, master_table.split('.')[1], cnt, elapsed))
+                pipeline_conn.commit()
+        with pipeline_conn.cursor() as cur:
+            cur.execute("""UPDATE pipeline_runs SET status = 'loaded', load_completed_at = NOW(),
+                records_loaded = %s, updated_at = NOW()
+                WHERE datasource_code = %s AND extract_version = %s""",
+                (total, DATASOURCE_CODE, label))
+            pipeline_conn.commit()
+        pipeline_conn.close()
         logger.info(f"Load complete: {total:,} total records")
         return True
     except Exception as e:
-        with state_conn.cursor() as cur:
-            cur.execute("UPDATE public.pipeline_state SET status = 'failed', error_message = %s WHERE extract_version = %s", (str(e), label))
-            state_conn.commit()
-        state_conn.close()
+        with pipeline_conn.cursor() as cur:
+            cur.execute("""UPDATE pipeline_runs SET status = 'failed', error_message = %s, updated_at = NOW()
+                WHERE datasource_code = %s AND extract_version = %s""",
+                (str(e), DATASOURCE_CODE, label))
+            pipeline_conn.commit()
+        pipeline_conn.close()
         raise
 
 
 def get_resume_tables(cur, label):
-    cur.execute("SELECT last_merged_table FROM public.pipeline_state WHERE extract_version = %s", (label,))
+    cur.execute("SELECT last_merged_table FROM pipeline_runs WHERE datasource_code = %s AND extract_version = %s",
+                (DATASOURCE_CODE, label))
     row = cur.fetchone()
     if row and row[0] and row[0] in MERGE_ORDER:
         idx = MERGE_ORDER.index(row[0]) + 1
@@ -306,7 +429,51 @@ def build_select_list(mapped_master, master_types):
     return ', '.join(select_parts)
 
 
-def merge_table(master_conn, version_conn, label, table_name, master_table, version_table, pkeys, master_types, mapped_master):
+def run_quality_checks(pipeline_conn, master_conn, table_name, master_table, label):
+    checks = []
+    with master_conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {master_table}")
+        row_count = cur.fetchone()[0]
+    checks.append(('row_count', {'count': row_count}, 'pass'))
+
+    with master_conn.cursor() as cur:
+        pk_cols = PK_COLS.get(table_name, [])
+        if pk_cols:
+            pk_list = ', '.join([f'"{pk}"' for pk in pk_cols])
+            cur.execute(f"SELECT COUNT(*) - COUNT(DISTINCT ({pk_list})) FROM {master_table}")
+            dup_count = cur.fetchone()[0]
+            status = 'fail' if dup_count > 0 else 'pass'
+            checks.append(('pk_duplicates', {'duplicate_count': dup_count}, status))
+
+    with master_conn.cursor() as cur:
+        cur.execute(f"""SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'kbo_master' AND table_name = %s AND udt_name NOT IN ('varchar','text')
+            ORDER BY ordinal_position""", (table_name,))
+        typed_cols = [r[0] for r in cur.fetchall()]
+    if typed_cols:
+        null_parts = []
+        for c in typed_cols:
+            null_parts.append(f'SUM(CASE WHEN "{c}" IS NULL THEN 1 ELSE 0 END) as "{c}"')
+        with master_conn.cursor() as cur:
+            cur.execute(f"SELECT {', '.join(null_parts)} FROM {master_table}")
+            null_counts = cur.fetchone()
+        for i, c in enumerate(typed_cols):
+            nc = null_counts[i] if null_counts else 0
+            rate = round(nc / max(row_count, 1), 4)
+            status = 'warn' if rate > 0.5 else 'pass'
+            checks.append(('null_rate', {'column': c, 'null_count': nc, 'rate': rate}, status))
+
+    for check_type, result, status in checks:
+        with pipeline_conn.cursor() as cur:
+            cur.execute("""INSERT INTO quality_checks (datasource_code, extract_version, table_name, check_type, check_result, status)
+                VALUES (%s, %s, %s, %s, %s, %s)""",
+                (DATASOURCE_CODE, label, table_name, check_type, json.dumps(result), status))
+        pipeline_conn.commit()
+    logger.info(f"  Quality checks: {len(checks)} checks ({sum(1 for _,_,s in checks if s=='fail')} fail, {sum(1 for _,_,s in checks if s=='warn')} warn)")
+
+
+def merge_table(master_conn, version_conn, pipeline_conn, label, table_name, master_table, version_table, pkeys, master_types, mapped_master):
+    t0 = time.time()
     with version_conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {version_table}")
         source_count = cur.fetchone()[0]
@@ -374,9 +541,12 @@ def merge_table(master_conn, version_conn, label, table_name, master_table, vers
     master_conn.commit()
     logger.info(f"  Upserted: {upserted:,}")
 
-    with master_conn.cursor() as cur:
-        cur.execute(f"RELEASE SAVEPOINT sp_upsert_{table_name}")
-    master_conn.commit()
+    try:
+        with master_conn.cursor() as cur:
+            cur.execute(f"RELEASE SAVEPOINT sp_upsert_{table_name}")
+        master_conn.commit()
+    except Exception:
+        pass
 
     with master_conn.cursor() as cur:
         cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
@@ -385,36 +555,44 @@ def merge_table(master_conn, version_conn, label, table_name, master_table, vers
     with master_conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {master_table}")
         master_after = cur.fetchone()[0]
-    with master_conn.cursor() as cur:
-        cur.execute("""INSERT INTO public.pipeline_metrics
-            (extract_version, table_name, operation, rows_count)
-            VALUES (%s, %s, 'MERGED', %s)""", (label, table_name, source_count))
-    master_conn.commit()
-    logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,})")
+
+    elapsed = time.time() - t0
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""INSERT INTO table_metrics (datasource_code, extract_version, table_name, operation, rows_count, duration_sec)
+            VALUES (%s, %s, %s, 'MERGED', %s, %s)""",
+            (DATASOURCE_CODE, label, table_name, source_count, elapsed))
+        pipeline_conn.commit()
+
+    run_quality_checks(pipeline_conn, master_conn, table_name, master_table, label)
+
+    logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,}) [{elapsed:.1f}s]")
     return source_count
 
 
 def merge_extract(label):
-    """Phase 1: Per-table upsert with continue-on-failure."""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
+    pipeline_conn = get_pipeline_conn()
 
     with master_conn.cursor() as cur:
         cur.execute("SET session_replication_role = 'replica';")
     master_conn.commit()
 
-    with master_conn.cursor() as cur:
-        cur.execute("SELECT status FROM public.pipeline_state WHERE extract_version = %s", (label,))
+    with pipeline_conn.cursor() as cur:
+        cur.execute("SELECT status FROM pipeline_runs WHERE datasource_code = %s AND extract_version = %s",
+                    (DATASOURCE_CODE, label))
         row = cur.fetchone()
         if row and row[0] == 'merged':
             logger.info(f"Version {label} already merged, skipping")
             return False
-    with master_conn.cursor() as cur:
-        cur.execute("UPDATE public.pipeline_state SET status = 'merging', merge_started_at = NOW() WHERE extract_version = %s", (label,))
-        master_conn.commit()
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""UPDATE pipeline_runs SET status = 'merging', merge_started_at = NOW(), updated_at = NOW()
+            WHERE datasource_code = %s AND extract_version = %s""",
+            (DATASOURCE_CODE, label))
+        pipeline_conn.commit()
 
-    with master_conn.cursor() as cur:
+    with pipeline_conn.cursor() as cur:
         tables_to_merge = get_resume_tables(cur, label)
     total_ops = 0
     failed_tables = []
@@ -432,14 +610,15 @@ def merge_extract(label):
                 master_conn, version_conn, table_name, version_table)
             logger.info(f"  Mapped {len(mapped_master)} cols: {mapped_master}")
 
-            ops = merge_table(master_conn, version_conn, label, table_name,
+            ops = merge_table(master_conn, version_conn, pipeline_conn, label, table_name,
                               master_table, version_table, pkeys, master_types, mapped_master)
             total_ops += ops
 
-            with master_conn.cursor() as cur:
-                cur.execute("UPDATE public.pipeline_state SET last_merged_table = %s WHERE extract_version = %s",
-                            (table_name, label))
-            master_conn.commit()
+            with pipeline_conn.cursor() as cur:
+                cur.execute("""UPDATE pipeline_runs SET last_merged_table = %s, updated_at = NOW()
+                    WHERE datasource_code = %s AND extract_version = %s""",
+                    (table_name, DATASOURCE_CODE, label))
+                pipeline_conn.commit()
             logger.info(f"  {table_name}: OK")
 
         except Exception as e:
@@ -454,20 +633,22 @@ def merge_extract(label):
             logger.info(f"  Continuing to next table...")
 
     if not failed_tables:
-        with master_conn.cursor() as cur:
-            cur.execute("""UPDATE public.pipeline_state
-                SET status = 'merged', merge_completed_at = NOW(), records_merged = %s
-                WHERE extract_version = %s""", (total_ops, label))
-            master_conn.commit()
+        with pipeline_conn.cursor() as cur:
+            cur.execute("""UPDATE pipeline_runs
+                SET status = 'merged', merge_completed_at = NOW(), records_merged = %s, updated_at = NOW()
+                WHERE datasource_code = %s AND extract_version = %s""", (total_ops, DATASOURCE_CODE, label))
+            pipeline_conn.commit()
         logger.info(f"Merge complete: {total_ops:,} total")
     else:
-        with master_conn.cursor() as cur:
-            cur.execute("""UPDATE public.pipeline_state
-                SET status = 'partial', error_message = %s
-                WHERE extract_version = %s""",
-                (f"Failed: {', '.join(failed_tables)}", label))
-            master_conn.commit()
+        with pipeline_conn.cursor() as cur:
+            cur.execute("""UPDATE pipeline_runs
+                SET status = 'partial', error_message = %s, updated_at = NOW()
+                WHERE datasource_code = %s AND extract_version = %s""",
+                (f"Failed: {', '.join(failed_tables)}", DATASOURCE_CODE, label))
+            pipeline_conn.commit()
         logger.warning(f"Merge partial: {len(failed_tables)} failed: {failed_tables}")
+
+    pipeline_conn.close()
 
     with master_conn.cursor() as cur:
         cur.execute("SET session_replication_role = 'origin';")
@@ -477,7 +658,6 @@ def merge_extract(label):
 
 
 def merge_incremental(label):
-    """Phase 2: Use reladiff to identify only changed rows, then apply delta."""
     from reladiff import connect_to_table, diff_tables
 
     dbname = get_version_db(label)
@@ -485,20 +665,24 @@ def merge_incremental(label):
     master_db_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{MASTER_DB}"
 
     master_conn = get_conn(MASTER_DB)
+    pipeline_conn = get_pipeline_conn()
 
     with master_conn.cursor() as cur:
         cur.execute("SET session_replication_role = 'replica';")
     master_conn.commit()
 
-    with master_conn.cursor() as cur:
-        cur.execute("SELECT status FROM public.pipeline_state WHERE extract_version = %s", (label,))
+    with pipeline_conn.cursor() as cur:
+        cur.execute("SELECT status FROM pipeline_runs WHERE datasource_code = %s AND extract_version = %s",
+                    (DATASOURCE_CODE, label))
         row = cur.fetchone()
         if row and row[0] == 'merged':
             logger.info(f"Version {label} already merged, skipping")
             return False
-    with master_conn.cursor() as cur:
-        cur.execute("UPDATE public.pipeline_state SET status = 'merging', merge_started_at = NOW() WHERE extract_version = %s", (label,))
-        master_conn.commit()
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""UPDATE pipeline_runs SET status = 'merging', merge_started_at = NOW(), updated_at = NOW()
+            WHERE datasource_code = %s AND extract_version = %s""",
+            (DATASOURCE_CODE, label))
+        pipeline_conn.commit()
 
     total_upserts = 0
     total_deletes = 0
@@ -587,11 +771,13 @@ def merge_incremental(label):
             total_upserts += len(to_upsert)
             total_deletes += len(to_delete)
 
-            with master_conn.cursor() as cur:
-                cur.execute("""INSERT INTO public.pipeline_metrics
-                    (extract_version, table_name, operation, rows_count)
-                    VALUES (%s, %s, 'MERGED', %s)""", (label, table_name, len(to_upsert) + len(to_delete)))
-            master_conn.commit()
+            with pipeline_conn.cursor() as cur:
+                cur.execute("""INSERT INTO table_metrics (datasource_code, extract_version, table_name, operation, rows_count)
+                    VALUES (%s, %s, %s, 'MERGED', %s)""",
+                    (DATASOURCE_CODE, label, table_name, len(to_upsert) + len(to_delete)))
+                pipeline_conn.commit()
+
+            run_quality_checks(pipeline_conn, master_conn, table_name, master_table, label)
             logger.info(f"  {table_name}: OK")
 
         except Exception as e:
@@ -603,11 +789,13 @@ def merge_incremental(label):
             except Exception:
                 pass
 
-    with master_conn.cursor() as cur:
-        cur.execute("""UPDATE public.pipeline_state
-            SET status = 'merged', merge_completed_at = NOW(), records_merged = %s
-            WHERE extract_version = %s""", (total_upserts + total_deletes, label))
-        master_conn.commit()
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""UPDATE pipeline_runs
+            SET status = 'merged', merge_completed_at = NOW(), records_merged = %s, updated_at = NOW()
+            WHERE datasource_code = %s AND extract_version = %s""",
+            (total_upserts + total_deletes, DATASOURCE_CODE, label))
+        pipeline_conn.commit()
+    pipeline_conn.close()
     logger.info(f"Incremental merge complete: {total_upserts:,} upserts, {total_deletes:,} deletes")
 
     with master_conn.cursor() as cur:
@@ -617,48 +805,70 @@ def merge_incremental(label):
 
 
 def show_status():
-    conn = get_conn(MASTER_DB)
+    pipeline_conn = get_pipeline_conn()
     print("\n" + "="*70)
-    print("PIPELINE STATUS")
+    print("PIPELINE STATUS (all datasources)")
     print("="*70)
-    with conn.cursor() as cur:
-        cur.execute("""SELECT extract_version, status, records_loaded, records_merged,
-            error_message, last_merged_table
-            FROM public.pipeline_state ORDER BY extract_version""")
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""SELECT r.datasource_code, d.name, r.extract_version, r.status,
+            r.records_loaded, r.records_merged, r.error_message, r.last_merged_table
+            FROM pipeline_runs r
+            JOIN datasource_registry d ON d.code = r.datasource_code
+            ORDER BY r.datasource_code, r.extract_version""")
+        current_ds = None
         for row in cur.fetchall():
-            print(f"\nVersion {row[0]}: {row[1]}")
-            print(f"  Loaded: {row[2] or 0:,} records")
-            print(f"  Merged: {row[3] or 0:,} records")
-            if row[4]:
-                print(f"  Error: {row[4]}")
-            if row[5]:
-                print(f"  Last merged table: {row[5]}")
+            if row[0] != current_ds:
+                current_ds = row[0]
+                print(f"\n--- {row[1]} ({row[0]}) ---")
+            print(f"  Version {row[2]}: {row[3]}")
+            print(f"    Loaded: {row[4] or 0:,} records")
+            print(f"    Merged: {row[5] or 0:,} records")
+            if row[6]:
+                print(f"    Error: {row[6]}")
+            if row[7]:
+                print(f"    Last merged table: {row[7]}")
     print("\n" + "-"*70)
-    print("METRICS")
+    print("TABLE METRICS")
     print("-"*70)
-    with conn.cursor() as cur:
-        cur.execute("""SELECT extract_version, table_name, operation, SUM(rows_count)
-            FROM public.pipeline_metrics
-            GROUP BY extract_version, table_name, operation
-            ORDER BY extract_version, table_name""")
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""SELECT datasource_code, extract_version, table_name, operation, SUM(rows_count), SUM(duration_sec)
+            FROM table_metrics
+            GROUP BY datasource_code, extract_version, table_name, operation
+            ORDER BY datasource_code, extract_version, table_name""")
         for row in cur.fetchall():
-            print(f"  {row[0]}/{row[1]}/{row[2]}: {row[3]:,}")
+            dur = f" ({row[5]:.1f}s)" if row[5] else ""
+            print(f"  {row[0]}/{row[1]}/{row[2]}/{row[3]}: {row[4]:,}{dur}")
     print("\n" + "-"*70)
-    print("MASTER TABLE COUNTS")
+    print("QUALITY CHECKS (latest per table)")
     print("-"*70)
-    with conn.cursor() as cur:
-        cur.execute("""SELECT 'activity' as tbl, COUNT(*) FROM kbo_master.activity
-            UNION ALL SELECT 'address', COUNT(*) FROM kbo_master.address
-            UNION ALL SELECT 'branch', COUNT(*) FROM kbo_master.branch
-            UNION ALL SELECT 'code', COUNT(*) FROM kbo_master.code
-            UNION ALL SELECT 'contact', COUNT(*) FROM kbo_master.contact
-            UNION ALL SELECT 'denomination', COUNT(*) FROM kbo_master.denomination
-            UNION ALL SELECT 'enterprise', COUNT(*) FROM kbo_master.enterprise
-            UNION ALL SELECT 'establishment', COUNT(*) FROM kbo_master.establishment
-            ORDER BY tbl""")
+    with pipeline_conn.cursor() as cur:
+        cur.execute("""SELECT qc.datasource_code, qc.table_name, qc.check_type, qc.status, qc.check_result
+            FROM quality_checks qc
+            WHERE qc.id = (SELECT MAX(id) FROM quality_checks WHERE datasource_code = qc.datasource_code AND table_name = qc.table_name AND check_type = qc.check_type)
+            ORDER BY qc.datasource_code, qc.table_name, qc.check_type""")
         for row in cur.fetchall():
-            print(f"  {row[0]}: {row[1]:,}")
-    conn.close()
+            print(f"  {row[0]}/{row[1]}/{row[2]}: {row[3]} {row[4]}")
+
+    if MASTER_DB:
+        print("\n" + "-"*70)
+        print(f"MASTER TABLE COUNTS ({MASTER_DB})")
+        print("-"*70)
+        master_conn = get_conn(MASTER_DB)
+        with master_conn.cursor() as cur:
+            cur.execute("""SELECT 'activity' as tbl, COUNT(*) FROM kbo_master.activity
+                UNION ALL SELECT 'address', COUNT(*) FROM kbo_master.address
+                UNION ALL SELECT 'branch', COUNT(*) FROM kbo_master.branch
+                UNION ALL SELECT 'code', COUNT(*) FROM kbo_master.code
+                UNION ALL SELECT 'contact', COUNT(*) FROM kbo_master.contact
+                UNION ALL SELECT 'denomination', COUNT(*) FROM kbo_master.denomination
+                UNION ALL SELECT 'enterprise', COUNT(*) FROM kbo_master.enterprise
+                UNION ALL SELECT 'establishment', COUNT(*) FROM kbo_master.establishment
+                ORDER BY tbl""")
+            for row in cur.fetchall():
+                print(f"  {row[0]}: {row[1]:,}")
+        master_conn.close()
+
+    pipeline_conn.close()
     print()
 
 
@@ -668,6 +878,7 @@ if __name__ == "__main__":
         sys.exit(1)
     command = sys.argv[1]
     if command == "status":
+        MASTER_DB = get_master_db()
         show_status()
     else:
         extract_path = command
@@ -675,7 +886,10 @@ if __name__ == "__main__":
         load_only = '--load-only' in sys.argv
         merge_only = '--merge-only' in sys.argv
         incremental = '--incremental' in sys.argv
-        logger.info(f"Pipeline for version {label}")
+        ds = os.getenv('DATASOURCE_CODE')
+        if ds:
+            DATASOURCE_CODE = ds
+        logger.info(f"Pipeline for version {label} (datasource: {DATASOURCE_CODE})")
         logger.info(f"Extract path: {extract_path}")
         init_master()
         if not merge_only:
