@@ -9,7 +9,7 @@ Fixes applied:
 - NULLIF(col,'') on all type casts (empty strings → NULL)
 - LTRIM(col,'0') on typeofdenomination (leading zeros)
 - to_date(col, 'DD-MM-YYYY') for KBO date format
-- Per-table SAVEPOINT with continue-on-failure
+- Per-table SAVEPOINT (after staging, before upsert) with continue-on-failure
 - Resume-from-table via last_merged_table
 - reladiff integration for incremental merges
 """
@@ -63,8 +63,6 @@ CAST_MAP = {
     'bool': 'boolean', 'float4': 'real', 'float8': 'double precision',
     'numeric': 'numeric',
 }
-
-KBO_DATE_COLS = {'datestrikingoff', 'startdate'}
 
 
 def cast_col(alias, col, pg_type, leading_zeros=False):
@@ -352,6 +350,9 @@ def merge_table(master_conn, version_conn, label, table_name, master_table, vers
     update_parts = [f'"{c}" = EXCLUDED."{c}"' for c in non_pk_cols]
     update_clause = ', '.join(update_parts)
 
+    with master_conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT sp_upsert_{table_name}")
+
     logger.info(f"  Upserting (DISTINCT ON {pk_list})...")
 
     with master_conn.cursor() as cur:
@@ -374,6 +375,10 @@ def merge_table(master_conn, version_conn, label, table_name, master_table, vers
     logger.info(f"  Upserted: {upserted:,}")
 
     with master_conn.cursor() as cur:
+        cur.execute(f"RELEASE SAVEPOINT sp_upsert_{table_name}")
+    master_conn.commit()
+
+    with master_conn.cursor() as cur:
         cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
     master_conn.commit()
 
@@ -390,7 +395,7 @@ def merge_table(master_conn, version_conn, label, table_name, master_table, vers
 
 
 def merge_extract(label):
-    """Phase 1: Per-table upsert with SAVEPOINT and continue-on-failure."""
+    """Phase 1: Per-table upsert with continue-on-failure."""
     dbname = get_version_db(label)
     master_conn = get_conn(MASTER_DB)
     version_conn = get_conn(dbname)
@@ -423,9 +428,6 @@ def merge_extract(label):
         logger.info(f"Merging {master_table}...")
 
         try:
-            with master_conn.cursor() as cur:
-                cur.execute(f"SAVEPOINT sp_{table_name}")
-
             _, mapped_master, master_types = get_table_mapping(
                 master_conn, version_conn, table_name, version_table)
             logger.info(f"  Mapped {len(mapped_master)} cols: {mapped_master}")
@@ -434,8 +436,6 @@ def merge_extract(label):
                               master_table, version_table, pkeys, master_types, mapped_master)
             total_ops += ops
 
-            with master_conn.cursor() as cur:
-                cur.execute(f"RELEASE SAVEPOINT sp_{table_name}")
             with master_conn.cursor() as cur:
                 cur.execute("UPDATE public.pipeline_state SET last_merged_table = %s WHERE extract_version = %s",
                             (table_name, label))
@@ -447,15 +447,9 @@ def merge_extract(label):
             import traceback
             traceback.print_exc()
             try:
-                with master_conn.cursor() as cur:
-                    cur.execute(f"ROLLBACK TO SAVEPOINT sp_{table_name}")
-                master_conn.commit()
-            except Exception as rollback_err:
-                logger.error(f"  {table_name}: ROLLBACK ALSO FAILED - {rollback_err}")
-                try:
-                    master_conn.rollback()
-                except Exception:
-                    pass
+                master_conn.rollback()
+            except Exception:
+                pass
             failed_tables.append(table_name)
             logger.info(f"  Continuing to next table...")
 
