@@ -10,6 +10,10 @@ Architecture:
 - Each master DB is pure data (no pipeline overhead)
 - Metabase connects to pipeline DB for dashboards
 
+Per-table metrics tracked:
+- LOADED: records loaded from CSV into version DB, per file, with status
+- MERGED: source rows, rows inserted, rows updated, duration, per table
+
 Fixes applied:
 - NULLIF(col,'') on all type casts (empty strings -> NULL)
 - LTRIM(col,'0') on typeofdenomination (leading zeros)
@@ -154,7 +158,11 @@ def init_pipeline_db():
             table_name VARCHAR(50) NOT NULL,
             operation VARCHAR(20) NOT NULL,
             rows_count BIGINT NOT NULL,
+            rows_inserted BIGINT,
+            rows_updated BIGINT,
+            status VARCHAR(20) DEFAULT 'completed',
             duration_sec FLOAT,
+            error_message TEXT,
             recorded_at TIMESTAMP DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS quality_checks (
             id SERIAL PRIMARY KEY,
@@ -169,6 +177,10 @@ def init_pipeline_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pr_status ON pipeline_runs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tm_datasource ON table_metrics(datasource_code, extract_version)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_qc_datasource ON quality_checks(datasource_code, check_type)")
+        cur.execute("ALTER TABLE table_metrics ADD COLUMN IF NOT EXISTS rows_inserted BIGINT")
+        cur.execute("ALTER TABLE table_metrics ADD COLUMN IF NOT EXISTS rows_updated BIGINT")
+        cur.execute("ALTER TABLE table_metrics ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'completed'")
+        cur.execute("ALTER TABLE table_metrics ADD COLUMN IF NOT EXISTS error_message TEXT")
     conn.commit()
     conn.close()
     logger.info("Pipeline database initialized.")
@@ -347,26 +359,46 @@ def load_extract(extract_path, label):
         create_version_db(label)
         total = 0
         for csv_file, master_table, version_table in TABLES:
+            table_name = master_table.split('.')[1]
             csv_path = os.path.join(extract_path, csv_file)
             if not os.path.exists(csv_path):
                 logger.warning(f"CSV not found: {csv_path}, skipping")
+                with pipeline_conn.cursor() as cur:
+                    cur.execute("""INSERT INTO table_metrics
+                        (datasource_code, extract_version, table_name, operation, rows_count, status, error_message)
+                        VALUES (%s, %s, %s, 'LOADED', 0, 'skipped', 'CSV file not found')""",
+                        (DATASOURCE_CODE, label, table_name))
+                    pipeline_conn.commit()
                 continue
             logger.info(f"Loading {csv_file}...")
             conn = get_conn(dbname)
             t0 = time.time()
-            load_csv(conn, csv_path, version_table)
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {version_table}")
-                cnt = cur.fetchone()[0]
-            conn.close()
-            elapsed = time.time() - t0
-            logger.info(f"  -> {cnt:,} rows ({elapsed:.1f}s)")
-            total += cnt
-            with pipeline_conn.cursor() as cur:
-                cur.execute("""INSERT INTO table_metrics (datasource_code, extract_version, table_name, operation, rows_count, duration_sec)
-                    VALUES (%s, %s, %s, 'LOADED', %s, %s)""",
-                    (DATASOURCE_CODE, label, master_table.split('.')[1], cnt, elapsed))
-                pipeline_conn.commit()
+            try:
+                load_csv(conn, csv_path, version_table)
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {version_table}")
+                    cnt = cur.fetchone()[0]
+                elapsed = time.time() - t0
+                logger.info(f"  -> {cnt:,} rows ({elapsed:.1f}s)")
+                total += cnt
+                with pipeline_conn.cursor() as cur:
+                    cur.execute("""INSERT INTO table_metrics
+                        (datasource_code, extract_version, table_name, operation, rows_count, status, duration_sec)
+                        VALUES (%s, %s, %s, 'LOADED', %s, 'completed', %s)""",
+                        (DATASOURCE_CODE, label, table_name, cnt, elapsed))
+                    pipeline_conn.commit()
+            except Exception as load_err:
+                elapsed = time.time() - t0
+                logger.error(f"  -> FAILED: {load_err}")
+                with pipeline_conn.cursor() as cur:
+                    cur.execute("""INSERT INTO table_metrics
+                        (datasource_code, extract_version, table_name, operation, rows_count, status, duration_sec, error_message)
+                        VALUES (%s, %s, %s, 'LOADED', 0, 'failed', %s, %s)""",
+                        (DATASOURCE_CODE, label, table_name, elapsed, str(load_err)))
+                    pipeline_conn.commit()
+                raise
+            finally:
+                conn.close()
         with pipeline_conn.cursor() as cur:
             cur.execute("""UPDATE pipeline_runs SET status = 'loaded', load_completed_at = NOW(),
                 records_loaded = %s, updated_at = NOW()
@@ -556,16 +588,20 @@ def merge_table(master_conn, version_conn, pipeline_conn, label, table_name, mas
         cur.execute(f"SELECT COUNT(*) FROM {master_table}")
         master_after = cur.fetchone()[0]
 
+    rows_inserted = max(0, master_after - master_before)
+    rows_updated = max(0, upserted - rows_inserted)
     elapsed = time.time() - t0
+
     with pipeline_conn.cursor() as cur:
-        cur.execute("""INSERT INTO table_metrics (datasource_code, extract_version, table_name, operation, rows_count, duration_sec)
-            VALUES (%s, %s, %s, 'MERGED', %s, %s)""",
-            (DATASOURCE_CODE, label, table_name, source_count, elapsed))
+        cur.execute("""INSERT INTO table_metrics
+            (datasource_code, extract_version, table_name, operation, rows_count, rows_inserted, rows_updated, status, duration_sec)
+            VALUES (%s, %s, %s, 'MERGED', %s, %s, %s, 'completed', %s)""",
+            (DATASOURCE_CODE, label, table_name, source_count, rows_inserted, rows_updated, elapsed))
         pipeline_conn.commit()
 
     run_quality_checks(pipeline_conn, master_conn, table_name, master_table, label)
 
-    logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,}) [{elapsed:.1f}s]")
+    logger.info(f"  {master_table}: {source_count:,} processed -> {master_after:,} (was {master_before:,}, +{rows_inserted:,} new, ~{rows_updated:,} updated) [{elapsed:.1f}s]")
     return source_count
 
 
@@ -629,6 +665,12 @@ def merge_extract(label):
                 master_conn.rollback()
             except Exception:
                 pass
+            with pipeline_conn.cursor() as cur:
+                cur.execute("""INSERT INTO table_metrics
+                    (datasource_code, extract_version, table_name, operation, rows_count, status, error_message)
+                    VALUES (%s, %s, %s, 'MERGED', 0, 'failed', %s)""",
+                    (DATASOURCE_CODE, label, table_name, str(e)))
+                pipeline_conn.commit()
             failed_tables.append(table_name)
             logger.info(f"  Continuing to next table...")
 
@@ -772,9 +814,10 @@ def merge_incremental(label):
             total_deletes += len(to_delete)
 
             with pipeline_conn.cursor() as cur:
-                cur.execute("""INSERT INTO table_metrics (datasource_code, extract_version, table_name, operation, rows_count)
-                    VALUES (%s, %s, %s, 'MERGED', %s)""",
-                    (DATASOURCE_CODE, label, table_name, len(to_upsert) + len(to_delete)))
+                cur.execute("""INSERT INTO table_metrics
+                    (datasource_code, extract_version, table_name, operation, rows_count, rows_inserted, rows_updated, status)
+                    VALUES (%s, %s, %s, 'MERGED', %s, %s, %s, 'completed')""",
+                    (DATASOURCE_CODE, label, table_name, len(to_upsert) + len(to_delete), len(to_upsert), len(to_delete)))
                 pipeline_conn.commit()
 
             run_quality_checks(pipeline_conn, master_conn, table_name, master_table, label)
@@ -828,16 +871,25 @@ def show_status():
             if row[7]:
                 print(f"    Last merged table: {row[7]}")
     print("\n" + "-"*70)
-    print("TABLE METRICS")
+    print("TABLE DETAILS")
     print("-"*70)
     with pipeline_conn.cursor() as cur:
-        cur.execute("""SELECT datasource_code, extract_version, table_name, operation, SUM(rows_count), SUM(duration_sec)
+        cur.execute("""SELECT datasource_code, extract_version, table_name, operation, status,
+            rows_count, rows_inserted, rows_updated, duration_sec, error_message
             FROM table_metrics
-            GROUP BY datasource_code, extract_version, table_name, operation
-            ORDER BY datasource_code, extract_version, table_name""")
+            ORDER BY datasource_code, extract_version, table_name, operation""")
+        current_ds_ver = None
         for row in cur.fetchall():
-            dur = f" ({row[5]:.1f}s)" if row[5] else ""
-            print(f"  {row[0]}/{row[1]}/{row[2]}/{row[3]}: {row[4]:,}{dur}")
+            ds_ver = f"{row[0]}/{row[1]}"
+            if ds_ver != current_ds_ver:
+                current_ds_ver = ds_ver
+                print(f"\n  === {ds_ver} ===")
+            dur = f" ({row[8]:.1f}s)" if row[8] else ""
+            inserts = f", +{row[6]:,} new" if row[6] else ""
+            updates = f", ~{row[7]:,} updated" if row[7] else ""
+            status_str = f" [{row[4]}]" if row[4] != 'completed' else ""
+            err = f" ERROR: {row[9]}" if row[9] else ""
+            print(f"    {row[2]:15s} {row[3]:7s}: {row[5]:>12,} rows{inserts}{updates}{dur}{status_str}{err}")
     print("\n" + "-"*70)
     print("QUALITY CHECKS (latest per table)")
     print("-"*70)
