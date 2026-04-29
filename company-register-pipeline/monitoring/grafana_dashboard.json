@@ -1,0 +1,262 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 50},
+              {"color": "red", "value": 80}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto"},
+      "targets": [
+        {
+          "expr": "count(pipeline_runs{status=\"running\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Running",
+      "type": "stat"
+    },
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "blue", "value": null}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto"},
+      "targets": [
+        {
+          "expr": "count(pipeline_runs{status=\"planned\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Planned",
+      "type": "stat"
+    },
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto"},
+      "targets": [
+        {
+          "expr": "count(pipeline_runs{status=\"completed\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Completed",
+      "type": "stat"
+    },
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto"},
+      "targets": [
+        {
+          "expr": "count(pipeline_runs{status=\"failed\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Failed",
+      "type": "stat"
+    },
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {"legend": false, "tooltip": false, "viz": false},
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {"type": "linear"},
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {"group": "A", "mode": "none"},
+            "thresholdsStyle": {"mode": "off"}
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 4},
+      "id": 5,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "avg(server_load_percent) by (run_id)",
+          "legendFormat": "Load",
+          "refId": "A",
+          "sql": "SELECT updated_at, server_load_percent FROM pipeline_runs WHERE server_load_percent IS NOT NULL ORDER BY updated_at DESC LIMIT 100"
+        }
+      ],
+      "title": "Server Load %",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto",
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          }
+        }
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 4},
+      "id": 6,
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "format": "table",
+          "group": [],
+          "metricColumn": "none",
+          "raw": true,
+          "rawSql": "SELECT pipeline_name, status, progress_percent, processed_items, total_items, batch_size, started_at, finished_at FROM pipeline_runs ORDER BY created_at DESC LIMIT 20",
+          "refId": "A",
+          "select": [[{"params": ["value"], "type": "column"}]]
+        }
+      ],
+      "title": "Recent Pipeline Runs",
+      "type": "table"
+    },
+    {
+      "datasource": "Pipeline DB",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 100,
+            "gradientMode": "none",
+            "hideFrom": {"legend": false, "tooltip": false, "viz": false},
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {"type": "linear"},
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {"group": "A", "mode": "normal"},
+            "thresholdsStyle": {"mode": "off"}
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "id": 7,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "format": "table",
+          "group": [],
+          "metricColumn": "none",
+          "raw": true,
+          "rawSql": "SELECT filename, status, progress_percent, processed_items, total_items FROM pipeline_run_items ORDER BY created_at DESC LIMIT 50",
+          "refId": "A",
+          "select": [[{"params": ["value"], "type": "column"}]]
+        }
+      ],
+      "title": "Per-File Progress",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 30,
+  "style": "dark",
+  "tags": ["pipeline", "monitoring", "kbo"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Pipeline Monitor",
+  "uid": "pipeline-monitor",
+  "version": 1
+}
